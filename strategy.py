@@ -310,7 +310,7 @@ def calc_signal(candles_5m, candles_1m):
     # ══════════════════════════════════════════════════════
     if (d_high >= sd2_h - tol and d_close < sd2_h + tol
             and d_high < sd3_h - tol * 0.5):
-        sl_price = round(sd2_h + at * 0.5, 2)  # SL resserré : référence +2SD (pas +3SD)
+        sl_price = round(sd2_h + at * 1.0, 2)  # SL : +2SD + 1×ATR — assez de marge pour le bruit
         tp1      = round(vwap, 2)
         tp2      = round(sd1_l, 2)
 
