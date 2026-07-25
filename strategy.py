@@ -187,6 +187,11 @@ def calc_signal(candles_5m, candles_1m):
     if len(candles_1m) < 5:
         return {"signal": None, "reason": "Pas assez de bougies 1m"}
 
+    # ── Filtre session active (London 7h-12h UTC / NY 13h-17h UTC) ──
+    current_hour = datetime.now(timezone.utc).hour
+    if current_hour not in SESSION_HOURS_UTC:
+        return {"signal": None, "reason": f"Hors session active (heure UTC={current_hour}h) — London 7h-12h · NY 13h-17h"}
+
     # ── Données 5m ───────────────────────────────────────
     closes_5m  = [c["close"]  for c in candles_5m]
     highs_5m   = [c["high"]   for c in candles_5m]
@@ -211,6 +216,9 @@ def calc_signal(candles_5m, candles_1m):
 
     if at / avg_at > 3.0:
         return {"signal": None, "reason": "Volatilité excessive (news)"}
+
+    if at < MIN_ATR:
+        return {"signal": None, "reason": f"ATR trop faible ({at:.2f}$) — session morte, on ne trade pas"}
 
     # ── VWAP + SD (calculé sur 5m) ───────────────────────
     vp = calc_vwap_session(candles_5m)
@@ -302,7 +310,7 @@ def calc_signal(candles_5m, candles_1m):
     # ══════════════════════════════════════════════════════
     if (d_high >= sd2_h - tol and d_close < sd2_h + tol
             and d_high < sd3_h - tol * 0.5):
-        sl_price = round(sd3_h + at * 0.3, 2)
+        sl_price = round(sd2_h + at * 0.5, 2)  # SL resserré : référence +2SD (pas +3SD)
         tp1      = round(vwap, 2)
         tp2      = round(sd1_l, 2)
 
