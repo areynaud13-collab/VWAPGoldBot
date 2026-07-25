@@ -1,0 +1,764 @@
+# ═══════════════════════════════════════════════════════
+# BOT 2 — VWAP SD SCALPER · XAU/USDT · BITGET · MTF
+# Stratégie mean-reversion institutionnelle
+# ─────────────────────────────────────────────────────
+# 4 Setups : SHORT +2SD / +3SD · LONG -2SD / -3SD
+# Multi-TimeFrame :
+#   15m → VWAP + SD + Sweep liquidité + CDV (détection)
+#   1m  → Bougie de rejet (confirmation entrée chirurgicale)
+# Gestion : 3 phases · Lot 1 → TP1(VWAP) · Runner → ±1SD
+# ═══════════════════════════════════════════════════════
+
+import time
+import logging
+import threading
+import requests as req
+from datetime import datetime, date, timezone
+from zoneinfo import ZoneInfo
+from config import *
+
+# Fuseau horaire Suisse (UTC+1 hiver / UTC+2 été — DST automatique)
+TZ_SWISS = ZoneInfo("Europe/Zurich")
+from strategy import calc_signal
+import bitget as exchange
+import dashboard
+
+
+# ── N8N Journal ────────────────────────────────────────
+def notify_n8n(pos, event_type, pnl_lot1, pnl_lot2, total_pnl, phase_atteinte, resultat, exit_price=None):
+    """Envoie les données du trade au webhook N8N Bot 2 → Google Sheets."""
+    if not N8N_WEBHOOK_URL:
+        return
+    try:
+        now        = datetime.now(TZ_SWISS)
+        entry_time = pos.get("entry_time", now)
+        duree      = int((now - entry_time).total_seconds() / 60)
+        tp2        = pos.get("tp_poc", pos["tp"])
+        data = {
+            "Date":                now.strftime("%Y-%m-%d"),
+            "Heure_UTC":           entry_time.strftime("%H:%M"),
+            "Bot":                 "BOT2_VWAP",
+            "Type":                event_type,
+            "Setup":               pos.get("setup", "VWAP"),
+            "Score":               pos.get("score", 0),
+            "Entree":              pos["entry"],
+            "SL":                  pos["sl"],
+            "TP1":                 pos["tp"],
+            "TP2":                 tp2,
+            "VWAP":                pos.get("vwap", ""),
+            "SD":                  pos.get("sd", ""),
+            "ATR":                 pos.get("atr", 0),
+            "RR_Cible":            pos.get("rr", 0),
+            "Phase_Atteinte":      phase_atteinte,
+            "Resultat":            resultat,
+            "PnL_Lot1":            round(pnl_lot1, 2),
+            "PnL_Lot2":            round(pnl_lot2, 2),
+            "PnL_Total":           round(total_pnl, 2),
+            "Capital_Avant":       round(pos.get("capital_at_entry", 0), 2),
+            "Capital_Apres":       round(state.paper_balance, 2),
+            "Duree_min":           duree,
+            "Prix_Sortie_Runner":  round(exit_price, 2) if event_type == "CLOSE_RUNNER" and exit_price is not None else "",
+            "Runner_Bonus_vs_TP2": round(exit_price - tp2, 2) if event_type == "CLOSE_RUNNER" and exit_price is not None else "",
+        }
+        req.post(N8N_WEBHOOK_URL, json=data, timeout=5)
+    except Exception as e:
+        log.warning(f"N8N webhook erreur: {e}")
+
+
+# ── Telegram ────────────────────────────────────────────
+def tg(msg):
+    try:
+        req.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"},
+            timeout=5
+        )
+    except Exception as e:
+        log.warning(f"Telegram erreur: {e}")
+
+
+# ── Logging ────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s │ %(levelname)s │ %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("bot2.log", encoding="utf-8"),
+    ]
+)
+log = logging.getLogger("bot2")
+
+
+# ── État partagé ───────────────────────────────────────
+class State:
+    def __init__(self):
+        self.positions      = []
+        self.last_price     = 0.0
+        self.paper_balance  = float(CAPITAL)
+        self.paper_pnl      = 0.0
+        self.paper_mode     = PAPER_MODE
+        self.total_trades   = 0
+        self.wins           = 0
+        self.losses         = 0
+        self.breakevens     = 0
+        self.daily_pnl      = 0.0
+        self.daily_trades   = 0
+        self.start_date     = date.today()
+        self.contract_size  = 0.01
+        self.last_sl_time   = 0
+        self.peak_capital   = float(CAPITAL)
+        self.dd_level       = 0
+        self.dd_pause_until = 0
+
+    def reset_daily(self):
+        if date.today() != self.start_date:
+            log.info(f"Nouveau jour · P&L hier: {self.daily_pnl:+.2f}$")
+            self.daily_pnl    = 0.0
+            self.daily_trades = 0
+            self.start_date   = date.today()
+
+    @property
+    def wr(self):
+        t = self.wins + self.losses
+        return self.wins / t * 100 if t > 0 else 0.0
+
+    @property
+    def capital(self):
+        if PAPER_MODE:
+            return self.paper_balance
+        try:
+            return exchange.get_balance()
+        except:
+            return self.paper_balance
+
+
+state  = State()
+trades = []
+
+
+def calc_qty_risk(price, sl_price, risk_pct):
+    cap      = state.capital
+    risk_usd = cap * risk_pct
+    sl_dist  = abs(price - sl_price)
+    if sl_dist <= 0:
+        return 1
+    contracts_by_risk   = risk_usd / (sl_dist * state.contract_size * LEVERAGE)
+    margin_per_contract = (price * state.contract_size) / LEVERAGE
+    max_margin          = cap * MAX_MARGIN_PCT
+    contracts_by_margin = max_margin / margin_per_contract if margin_per_contract > 0 else contracts_by_risk
+    return max(1, int(min(contracts_by_risk, contracts_by_margin)))
+
+
+def open_position(sig, dd_level=0):
+    if len(state.positions) >= MAX_POSITIONS:
+        return
+
+    side_str = sig["signal"]
+    price    = sig["price"]
+    atr      = sig["atr"]
+    sl       = sig["sl_price"]
+    tp       = sig["tp_price"]     # TP1 = VWAP
+    tp_poc   = sig.get("tp_poc", tp)   # TP2 = ±1SD opposé
+    score    = sig["score"]
+    reason   = sig["reason"]
+    rr       = sig.get("rr", round(abs(tp - price) / max(abs(price - sl), 0.01), 1))
+    setup    = sig.get("setup", "VWAP")
+    vwap     = sig.get("vwap", 0)
+    sd       = sig.get("sd", 0)
+    sd2_h    = sig.get("sd2_h", 0)
+    sd3_h    = sig.get("sd3_h", 0)
+    sd2_l    = sig.get("sd2_l", 0)
+    sd3_l    = sig.get("sd3_l", 0)
+
+    utc_hour = datetime.now(timezone.utc).hour
+
+    if utc_hour in REDUCED_RISK_HOURS:
+        effective_risk = REDUCED_RISK_PCT
+        log.info(f"Heure risque réduit {utc_hour:02d}h UTC")
+    elif dd_level >= 2:
+        effective_risk = RISK_PER_TRADE / 2
+        log.info("DD N2 — risque réduit à 1%")
+    else:
+        effective_risk = RISK_PER_TRADE
+
+    total_contracts = calc_qty_risk(price, sl, effective_risk)
+    if total_contracts >= 2:
+        runner_contracts = max(1, int(total_contracts * RUNNER_PCT))
+        lot1_contracts   = total_contracts - runner_contracts
+    else:
+        runner_contracts = 0
+        lot1_contracts   = total_contracts
+
+    # ── Garde : TP2 doit être au-delà de TP1 dans le bon sens ──
+    if (side_str == "long"  and tp_poc <= tp) or \
+       (side_str == "short" and tp_poc >= tp):
+        log.warning(f"[Guard] TP2 {tp_poc} invalide vs TP1 {tp} ({setup}) — runner désactivé")
+        runner_contracts = 0
+        lot1_contracts   = total_contracts
+
+    cap_now   = state.capital
+    risk_real = abs(price - sl) * total_contracts * state.contract_size * LEVERAGE
+    risk_pct  = risk_real / cap_now * 100
+
+    log.info("")
+    log.info("=" * 60)
+    log.info(f"SIGNAL {side_str.upper()} {setup} · Score {score} · Slot {len(state.positions)+1}/{MAX_POSITIONS}")
+    log.info(f"   Prix : ${price:.2f} · SL: ${sl:.2f} · TP1(VWAP): ${tp:.2f} · TP2: ${tp_poc:.2f}")
+    log.info(f"   VWAP : {vwap:.2f} · SD : {sd:.2f}")
+    log.info(f"   Bandes : +2SD={sd2_h:.2f} +3SD={sd3_h:.2f} -2SD={sd2_l:.2f} -3SD={sd3_l:.2f}")
+    log.info(f"   RR   : 1:{rr} · Total: {total_contracts}c (Lot1: {lot1_contracts} + Runner: {runner_contracts})")
+    log.info(f"   Risque: {risk_pct:.1f}% = ${risk_real:.2f} · Mode: {'PAPER' if PAPER_MODE else 'LIVE'}")
+    log.info("=" * 60)
+
+    tg(
+        f"{'🔴' if side_str == 'short' else '🟢'} <b>BOT 2 — SIGNAL {side_str.upper()} XAU/USDT — {setup}</b>\n"
+        f"\n"
+        f"📍 Entrée        : <b>${price:.2f}</b>\n"
+        f"🛑 SL            : ${sl:.2f}\n"
+        f"🎯 TP1 (VWAP)   : ${tp:.2f}  ← objectif principal\n"
+        f"🏃 TP2 (runner) : ${tp_poc:.2f}  ← ±1SD opposé\n"
+        f"\n"
+        f"📐 <b>Contexte VWAP</b>\n"
+        f"   VWAP  : {vwap:.2f}   SD : {sd:.2f}\n"
+        f"   +2SD  : {sd2_h:.2f}   +3SD : {sd3_h:.2f}\n"
+        f"   -2SD  : {sd2_l:.2f}   -3SD : {sd3_l:.2f}\n"
+        f"\n"
+        f"📊 RR 1:{rr}  · Score {score}/9\n"
+        f"💼 Lot 1 : {lot1_contracts} contrats → ferme au TP1\n"
+        f"🏃 Lot 2 : {runner_contracts} contrats → runner vers TP2\n"
+        f"⚠️  Risque : {risk_pct:.1f}% = ${risk_real:.2f}\n"
+        f"💰 Capital : ${cap_now:.2f}\n"
+        f"{'📄 PAPER MODE' if PAPER_MODE else '💰 LIVE BITGET'}"
+    )
+
+    position_id = None
+    if not PAPER_MODE:
+        try:
+            bg_side = 1 if side_str == "long" else 3
+            order = exchange.place_order(bg_side, total_contracts)
+            log.info(f"Ordre Bitget: {order}")
+            time.sleep(1)
+            open_pos = exchange.get_open_positions(SYMBOL)
+            if open_pos:
+                position_id = open_pos[-1].get("positionId")
+                if position_id:
+                    exchange.set_stop_loss_take_profit(position_id, sl, tp)
+        except Exception as e:
+            log.error(f"Erreur ordre: {e}")
+            return
+
+    state.positions.append({
+        "side":             side_str,
+        "entry":            price,
+        "sl":               sl,
+        "tp":               tp,
+        "tp_poc":           tp_poc,
+        "atr":              atr,
+        "vwap":             vwap,
+        "sd":               sd,
+        "contracts":        total_contracts,
+        "lot1_contracts":   lot1_contracts,
+        "runner_contracts": runner_contracts,
+        "phase":            1,
+        "runner_active":    False,
+        "runner_sl":        None,
+        "highest_close":    0.0,
+        "runner_stall":     0,
+        "tp1_pnl":          0.0,
+        "capital_at_entry": cap_now,
+        "risk_usd":         risk_real,
+        "position_id":      position_id,
+        "setup":            setup,
+        "score":            score,
+        "entry_time":       datetime.now(TZ_SWISS),
+        "rr":               rr,
+    })
+    state.daily_trades += 1
+    state.total_trades += 1
+
+
+def check_exits(current_price, last_candle=None):
+    if not state.positions:
+        return
+
+    candle_high  = last_candle["high"]  if last_candle else current_price
+    candle_low   = last_candle["low"]   if last_candle else current_price
+    candle_close = last_candle["close"] if last_candle else current_price
+
+    still_open = []
+    for pos in state.positions:
+        ep        = pos["entry"]
+        atr       = pos["atr"]
+        setup     = pos["setup"]
+        cap_entry = pos.get("capital_at_entry", state.paper_balance)
+        phase     = pos.get("phase", 1)
+
+        # ══════════════════════════════════════════════════
+        # PHASE 3 — RUNNER Chandelier Exit
+        # ══════════════════════════════════════════════════
+        if phase == 3:
+            runner_sl        = pos["runner_sl"]
+            runner_contracts = pos["runner_contracts"]
+
+            if pos["side"] == "long":
+                if candle_close > pos["highest_close"]:
+                    pos["highest_close"] = candle_close
+                    pos["runner_stall"]  = 0
+                else:
+                    pos["runner_stall"] += 1
+                new_trail        = pos["highest_close"] - RUNNER_TRAIL_ATR * atr
+                pos["runner_sl"] = max(runner_sl, new_trail)
+                runner_sl        = pos["runner_sl"]
+                hit_sl        = candle_low  <= runner_sl
+                hit_time_exit = pos["runner_stall"] >= RUNNER_MAX_STALL
+
+            else:  # short
+                if candle_close < pos["highest_close"] or pos["highest_close"] == 0.0:
+                    pos["highest_close"] = candle_close
+                    pos["runner_stall"]  = 0
+                else:
+                    pos["runner_stall"] += 1
+                new_trail        = pos["highest_close"] + RUNNER_TRAIL_ATR * atr
+                pos["runner_sl"] = min(runner_sl, new_trail)
+                runner_sl        = pos["runner_sl"]
+                hit_sl        = candle_high >= runner_sl
+                hit_time_exit = pos["runner_stall"] >= RUNNER_MAX_STALL
+
+            if not hit_sl and not hit_time_exit:
+                still_open.append(pos)
+                continue
+
+            exit_price = runner_sl if hit_sl else current_price
+            exit_label = ("SL Chandelier" if hit_sl
+                          else f"Time Exit ({RUNNER_MAX_STALL} bougies sans nouveau haut)")
+
+            raw_pnl    = (exit_price - ep) / ep if pos["side"] == "long" else (ep - exit_price) / ep
+            pnl_runner = raw_pnl * runner_contracts * state.contract_size * ep * LEVERAGE
+            tp1_pnl    = pos.get("tp1_pnl", 0.0)
+            total_pnl  = tp1_pnl + pnl_runner
+            acct_pct   = total_pnl / cap_entry * 100 if cap_entry else 0
+
+            if not PAPER_MODE:
+                try:
+                    close_side = 2 if pos["side"] == "long" else 4
+                    exchange.place_order(close_side, runner_contracts)
+                except Exception as e:
+                    log.error(f"Fermeture runner error: {e}")
+                    still_open.append(pos)
+                    continue
+
+            state.paper_balance += pnl_runner
+            state.paper_pnl     += pnl_runner
+            state.daily_pnl     += pnl_runner
+
+            if total_pnl > 0.01:      state.wins      += 1
+            elif abs(total_pnl) < 0.01: state.breakevens += 1
+            else:
+                state.losses       += 1
+                state.last_sl_time  = time.time()
+
+            trades.append({"e": ep, "x": exit_price, "side": pos["side"],
+                           "pnl": round(total_pnl, 2), "res": f"RUNNER — {exit_label}",
+                           "setup": setup, "date": datetime.now().strftime("%m/%d %H:%M")})
+            resultat_runner = "WIN" if total_pnl > 0.01 else ("LOSS" if total_pnl < -0.01 else "BE")
+            notify_n8n(pos, "CLOSE_RUNNER", tp1_pnl, pnl_runner, total_pnl, 3, resultat_runner, exit_price=exit_price)
+
+            log.info(f"[Ph3 RUNNER] {pos['side'].upper()} [{setup}] {exit_label} · "
+                     f"${ep:.2f}→${exit_price:.2f} · Runner: {pnl_runner:+.2f}$ · Total: {total_pnl:+.2f}$")
+            icon = "⏱️" if not hit_sl else ("📉" if pnl_runner < 0 else "💹")
+            tg(
+                f"{icon} <b>BOT 2 — RUNNER FERMÉ — {setup} — {exit_label}</b>\n"
+                f"\n"
+                f"📍 Entrée       : ${ep:.2f}\n"
+                f"✅ TP1 (VWAP)  : ${pos['tp']:.2f}   P&L: +${tp1_pnl:.2f}$\n"
+                f"🏁 Runner exit  : ${exit_price:.2f}  P&L: {pnl_runner:+.2f}$\n"
+                f"   (SL Chandelier: ${runner_sl:.2f})\n"
+                f"\n"
+                f"💰 P&L total    : <b>{total_pnl:+.2f}$</b>  ({acct_pct:+.2f}%)\n"
+                f"📈 Capital      : ${state.paper_balance:.2f}\n"
+                f"🎯 Win Rate     : {state.wr:.0f}%  ({state.wins}W / {state.losses}L)\n"
+                f"{'📄 PAPER MODE' if PAPER_MODE else '💰 LIVE BITGET'}"
+            )
+            continue
+
+        # ══════════════════════════════════════════════════
+        # PHASE 2 — Lot 2 seul, SL = TP1, cible TP2
+        # ══════════════════════════════════════════════════
+        elif phase == 2:
+            sl_lot2          = pos["tp"]
+            tp2_price        = pos["tp_poc"]
+            runner_contracts = pos["runner_contracts"]
+            tp1_pnl          = pos.get("tp1_pnl", 0.0)
+
+            if pos["side"] == "long":
+                hit_sl  = candle_low  <= sl_lot2
+                hit_tp2 = candle_high >= tp2_price
+            else:
+                hit_sl  = candle_high >= sl_lot2
+                hit_tp2 = candle_low  <= tp2_price
+
+            if hit_sl and hit_tp2:
+                hit_tp2 = True   # TP2 prioritaire
+
+            if hit_tp2:
+                actual_runner = max(1, int(runner_contracts * RUNNER_TP2_KEEP))
+                close_at_tp2  = runner_contracts - actual_runner
+
+                pnl_tp2_close = 0.0
+                if close_at_tp2 > 0:
+                    raw_tp2 = (tp2_price - ep) / ep if pos["side"] == "long" else (ep - tp2_price) / ep
+                    pnl_tp2_close = raw_tp2 * close_at_tp2 * state.contract_size * ep * LEVERAGE
+                    if not PAPER_MODE:
+                        try:
+                            close_side = 2 if pos["side"] == "long" else 4
+                            exchange.place_order(close_side, close_at_tp2)
+                        except Exception as e:
+                            log.error(f"Fermeture partielle TP2 error: {e}")
+                    state.paper_balance += pnl_tp2_close
+                    state.paper_pnl     += pnl_tp2_close
+                    state.daily_pnl     += pnl_tp2_close
+                    pos["tp1_pnl"]      += pnl_tp2_close
+
+                pos["runner_contracts"] = actual_runner
+                pos["phase"]            = 3
+                pos["runner_active"]    = True
+                pos["runner_sl"]        = tp2_price
+                pos["highest_close"]    = candle_close
+                pos["runner_stall"]     = 0
+
+                log.info(f"[Ph2→3] TP2 ${tp2_price:.2f} atteint · "
+                         f"{close_at_tp2}c fermés +${pnl_tp2_close:.2f}$ · Runner: {actual_runner}c")
+                tg(
+                    f"🚀 <b>BOT 2 — TP2 ATTEINT — {setup}</b>\n"
+                    f"\n"
+                    f"📍 Entrée         : ${ep:.2f}\n"
+                    f"✅ TP1 (VWAP)    : ${pos['tp']:.2f}   P&L: +${tp1_pnl:.2f}$\n"
+                    f"✅ TP2 (70% Lot2) : ${tp2_price:.2f}  P&L: +${pnl_tp2_close:.2f}$\n"
+                    f"\n"
+                    f"🏃 <b>Runner actif</b> : {actual_runner} contrats (30% Lot 2)\n"
+                    f"🛡️ SL plancher    : ${tp2_price:.2f}\n"
+                    f"📏 Chandelier     : {RUNNER_TRAIL_ATR}× ATR\n"
+                    f"⏱️ Time exit      : {RUNNER_MAX_STALL} bougies 15m sans nouveau haut\n"
+                    f"📈 Capital        : ${state.paper_balance:.2f}\n"
+                    f"{'📄 PAPER MODE' if PAPER_MODE else '💰 LIVE BITGET'}"
+                )
+                still_open.append(pos)
+                continue
+
+            if hit_sl:
+                exit_price = sl_lot2
+                raw_pnl    = (exit_price - ep) / ep if pos["side"] == "long" else (ep - exit_price) / ep
+                pnl_lot2   = raw_pnl * runner_contracts * state.contract_size * ep * LEVERAGE
+                total_pnl  = tp1_pnl + pnl_lot2
+                acct_pct   = total_pnl / cap_entry * 100 if cap_entry else 0
+
+                if not PAPER_MODE:
+                    try:
+                        close_side = 2 if pos["side"] == "long" else 4
+                        exchange.place_order(close_side, runner_contracts)
+                    except Exception as e:
+                        log.error(f"Fermeture Lot 2 error: {e}")
+                        still_open.append(pos)
+                        continue
+
+                state.paper_balance += pnl_lot2
+                state.paper_pnl     += pnl_lot2
+                state.daily_pnl     += pnl_lot2
+                state.wins          += 1
+
+                trades.append({"e": ep, "x": exit_price, "side": pos["side"],
+                               "pnl": round(total_pnl, 2), "res": "TP1×2 (retour SL Lot 2)",
+                               "setup": setup, "date": datetime.now().strftime("%m/%d %H:%M")})
+                notify_n8n(pos, "CLOSE_LOT2_TP1", tp1_pnl, pnl_lot2, total_pnl, 2, "WIN")
+
+                tg(
+                    f"✅ <b>BOT 2 — LOT 2 FERMÉ au retour TP1 — {setup}</b>\n"
+                    f"\n"
+                    f"📍 Entrée      : ${ep:.2f}\n"
+                    f"✅ TP1 (Lot 1) : ${pos['tp']:.2f}   P&L: +${tp1_pnl:.2f}$\n"
+                    f"🛑 SL Lot 2    : ${exit_price:.2f}  P&L: +${pnl_lot2:.2f}$\n"
+                    f"💰 P&L total   : <b>+{total_pnl:.2f}$</b>  ({acct_pct:+.2f}%)\n"
+                    f"📈 Capital     : ${state.paper_balance:.2f}\n"
+                    f"🎯 Win Rate    : {state.wr:.0f}%  ({state.wins}W / {state.losses}L)\n"
+                    f"{'📄 PAPER MODE' if PAPER_MODE else '💰 LIVE BITGET'}"
+                )
+                continue
+
+            still_open.append(pos)
+            continue
+
+        # ══════════════════════════════════════════════════
+        # PHASE 1 — Les 2 lots, SL initial, cible TP1
+        # ══════════════════════════════════════════════════
+        else:
+            sl = pos["sl"]
+            tp = pos["tp"]
+
+            if pos["side"] == "long":
+                hit_tp = candle_high >= tp
+                hit_sl = candle_low  <= sl
+            else:
+                hit_tp = candle_low  <= tp
+                hit_sl = candle_high >= sl
+
+            if hit_sl and hit_tp:
+                hit_sl = True   # SL prioritaire en phase 1
+
+            if not hit_sl and not hit_tp:
+                still_open.append(pos)
+                continue
+
+            lot1_contracts   = pos["lot1_contracts"]
+            runner_contracts = pos["runner_contracts"]
+            total_contracts  = pos["contracts"]
+
+            # ── TP1 atteint → fermer Lot 1, passer Phase 2 ──
+            if hit_tp and runner_contracts > 0:
+                exit_price_lot1 = tp
+                raw_pnl_lot1    = (exit_price_lot1 - ep) / ep if pos["side"] == "long" else (ep - exit_price_lot1) / ep
+                pnl_lot1        = raw_pnl_lot1 * lot1_contracts * state.contract_size * ep * LEVERAGE
+
+                if not PAPER_MODE:
+                    try:
+                        close_side = 2 if pos["side"] == "long" else 4
+                        exchange.place_order(close_side, lot1_contracts)
+                    except Exception as e:
+                        log.error(f"Fermeture Lot 1 error: {e}")
+                        still_open.append(pos)
+                        continue
+
+                state.paper_balance += pnl_lot1
+                state.paper_pnl     += pnl_lot1
+                state.daily_pnl     += pnl_lot1
+
+                pos["phase"]   = 2
+                pos["tp1_pnl"] = pnl_lot1
+                acct_pct_lot1  = pnl_lot1 / cap_entry * 100 if cap_entry else 0
+
+                log.info(f"[Ph1→2] TP1/VWAP ${tp:.2f} atteint · Lot 1 ({lot1_contracts}c) +${pnl_lot1:.2f} · "
+                         f"Lot 2 ({runner_contracts}c) SL → VWAP ${tp:.2f} · Cible TP2 ${pos['tp_poc']:.2f}")
+                tg(
+                    f"✅ <b>BOT 2 — TP1 ATTEINT — Lot 1 fermé — {setup}</b>\n"
+                    f"\n"
+                    f"📍 Entrée     : ${ep:.2f}\n"
+                    f"🎯 TP1 (VWAP) : ${tp:.2f}\n"
+                    f"💰 Lot 1 P&L  : <b>+${pnl_lot1:.2f}$</b>  ({acct_pct_lot1:+.2f}%)\n"
+                    f"\n"
+                    f"📊 <b>Phase 2 — Lot 2 vers ±1SD</b> : {runner_contracts} contrats\n"
+                    f"🛑 SL Lot 2   : ${tp:.2f}  (= VWAP — profit garanti)\n"
+                    f"🎯 Cible TP2  : ${pos['tp_poc']:.2f}  (±1SD)\n"
+                    f"📈 Capital    : ${state.paper_balance:.2f}\n"
+                    f"{'📄 PAPER MODE' if PAPER_MODE else '💰 LIVE BITGET'}"
+                )
+                still_open.append(pos)
+                continue
+
+            # ── TP1 atteint, 1 seul contrat → fermer tout ──
+            if hit_tp and runner_contracts == 0:
+                exit_price = tp
+                raw_pnl    = (exit_price - ep) / ep if pos["side"] == "long" else (ep - exit_price) / ep
+                pnl_usd    = raw_pnl * total_contracts * state.contract_size * ep * LEVERAGE
+                acct_pct   = pnl_usd / cap_entry * 100 if cap_entry else 0
+
+                if not PAPER_MODE:
+                    try:
+                        close_side = 2 if pos["side"] == "long" else 4
+                        exchange.place_order(close_side, total_contracts)
+                    except Exception as e:
+                        log.error(f"Fermeture TP1 error: {e}")
+                        still_open.append(pos)
+                        continue
+
+                state.paper_balance += pnl_usd
+                state.paper_pnl     += pnl_usd
+                state.daily_pnl     += pnl_usd
+                state.wins          += 1
+
+                trades.append({"e": ep, "x": exit_price, "side": pos["side"],
+                               "pnl": round(pnl_usd, 2), "res": "TP1 (1 contrat)",
+                               "setup": setup, "date": datetime.now().strftime("%m/%d %H:%M")})
+                notify_n8n(pos, "CLOSE_TP1", pnl_usd, 0, pnl_usd, 1, "WIN")
+
+                tg(
+                    f"🎯 <b>BOT 2 — TP1 ATTEINT — {setup}</b> (1 contrat)\n"
+                    f"📍 Entrée  : ${ep:.2f}   🎯 TP1 : ${exit_price:.2f}\n"
+                    f"💰 P&L : <b>{pnl_usd:+.2f}$</b>  ({acct_pct:+.2f}%)\n"
+                    f"📈 Capital : ${state.paper_balance:.2f}  · WR: {state.wr:.0f}%\n"
+                    f"{'📄 PAPER MODE' if PAPER_MODE else '💰 LIVE BITGET'}"
+                )
+                continue
+
+            # ── SL touché → fermer les 2 lots ───────────
+            exit_price = sl
+            raw_pnl    = (exit_price - ep) / ep if pos["side"] == "long" else (ep - exit_price) / ep
+            pnl_usd    = raw_pnl * total_contracts * state.contract_size * ep * LEVERAGE
+            acct_pct   = pnl_usd / cap_entry * 100 if cap_entry else 0
+
+            if not PAPER_MODE:
+                try:
+                    close_side = 2 if pos["side"] == "long" else 4
+                    exchange.place_order(close_side, total_contracts)
+                except Exception as e:
+                    log.error(f"Fermeture SL error: {e}")
+                    still_open.append(pos)
+                    continue
+
+            state.paper_balance += pnl_usd
+            state.paper_pnl     += pnl_usd
+            state.daily_pnl     += pnl_usd
+            state.losses        += 1
+            state.last_sl_time   = time.time()
+
+            trades.append({"e": ep, "x": exit_price, "side": pos["side"],
+                           "pnl": round(pnl_usd, 2), "res": "SL",
+                           "setup": setup, "date": datetime.now().strftime("%m/%d %H:%M")})
+            notify_n8n(pos, "CLOSE_SL", pnl_usd, 0, pnl_usd, 1, "LOSS")
+
+            log.info(f"SL {pos['side'].upper()} [{setup}] ${ep:.2f}→${exit_price:.2f} · "
+                     f"{pnl_usd:+.2f}$ · Capital: ${state.paper_balance:.2f}")
+            tg(
+                f"❌ <b>BOT 2 — SL TOUCHÉ — {setup}</b>\n"
+                f"\n"
+                f"📍 Entrée  : ${ep:.2f}   🛑 SL : ${exit_price:.2f}\n"
+                f"💰 P&L : <b>{pnl_usd:+.2f}$</b>  ({acct_pct:+.2f}%)\n"
+                f"📈 Capital : ${state.paper_balance:.2f}  · WR: {state.wr:.0f}%\n"
+                f"📊 P&L jour: {state.daily_pnl:+.2f}$\n"
+                f"⏸️ Cooldown: {COOLDOWN_AFTER_SL//60} min\n"
+                f"{'📄 PAPER MODE' if PAPER_MODE else '💰 LIVE BITGET'}"
+            )
+
+    state.positions = still_open
+
+
+def check_drawdown():
+    cap = state.capital
+    if cap > state.peak_capital:
+        state.peak_capital = cap
+        if state.dd_level > 0:
+            state.dd_level = 0
+            tg(f"✅ <b>BOT 2 — Nouveau pic : ${cap:.2f}</b>\nDrawdown remis à zéro")
+
+    dd = (state.peak_capital - cap) / state.peak_capital if state.peak_capital > 0 else 0
+
+    if state.dd_pause_until > time.time():
+        remaining = int((state.dd_pause_until - time.time()) / 60)
+        log.info(f"DD pause niveau 3 — {remaining}min restantes")
+        return False
+
+    old_level = state.dd_level
+    if dd >= DD_LEVEL3:        state.dd_level = 3
+    elif dd >= DD_LEVEL2:      state.dd_level = 2
+    elif dd >= DD_LEVEL1:      state.dd_level = 1
+    else:                      state.dd_level = 0
+
+    if state.dd_level != old_level:
+        dd_pct = round(dd * 100, 1)
+        if state.dd_level == 3:
+            state.dd_pause_until = time.time() + DD_PAUSE
+            tg(f"🔴 <b>BOT 2 — DD Niveau 3 — {dd_pct}%</b>\nPAUSE COMPLÈTE 1 heure")
+            return False
+        elif state.dd_level == 2:
+            tg(f"🟠 <b>BOT 2 — DD Niveau 2 — {dd_pct}%</b>\nRisque réduit à 1%")
+        elif state.dd_level == 1:
+            tg(f"⚠️ <b>BOT 2 — DD Niveau 1 — {dd_pct}%</b>\nScore minimum relevé")
+
+    return True
+
+
+def main():
+    log.info("=" * 60)
+    log.info("  BOT 2 — VWAP SD SCALPER [BITGET] — MTF 15m/1m")
+    log.info(f"  {SYMBOL} · Capital: ${CAPITAL} · Levier: {LEVERAGE}x")
+    log.info(f"  Setups : SHORT +2SD/+3SD · LONG -2SD/-3SD → VWAP")
+    log.info(f"  Mode: {'PAPER' if PAPER_MODE else 'LIVE FUTURES BITGET'}")
+    log.info("=" * 60)
+
+    try:
+        info = exchange.get_contract_info(SYMBOL)
+        state.contract_size = info["contractSize"]
+        log.info(f"1 contrat = {state.contract_size} oz XAU (Bitget)")
+        tg(
+            f"🤖 <b>BOT 2 VWAP démarré sur Bitget</b>\n"
+            f"📊 {SYMBOL} · Levier {LEVERAGE}x · 1 contrat = {state.contract_size} oz\n"
+            f"🎯 Stratégie : VWAP SD · Mean Reversion · MTF 15m/1m\n"
+            f"📐 Setups : SHORT +2/+3SD · LONG -2/-3SD → VWAP\n"
+            f"💰 Capital : ${state.capital:.2f}\n"
+            f"{'📄 PAPER MODE — aucun ordre réel' if PAPER_MODE else '💰 LIVE — ordres réels actifs'}"
+        )
+    except Exception as e:
+        log.warning(f"contract_size=0.01 par défaut ({e})")
+        tg(f"⚠️ BOT 2 démarré (contract_size par défaut)\n{e}")
+
+    if not PAPER_MODE:
+        try:
+            exchange.set_leverage(SYMBOL, LEVERAGE)
+        except Exception as e:
+            log.warning(f"Levier: {e}")
+
+    while True:
+        try:
+            state.reset_daily()
+
+            if not check_drawdown():
+                time.sleep(LOOP_SECONDS)
+                continue
+
+            # ── Fetch MTF : 15m (signal) + 1m (confirmation) ──
+            candles_5m = exchange.get_candles(SYMBOL, INTERVAL_SIGNAL, CANDLES_NEEDED + 10)
+            if not candles_5m:
+                time.sleep(60)
+                continue
+
+            candles_1m = exchange.get_candles(SYMBOL, INTERVAL_CONFIRM, CANDLES_CONFIRM + 5)
+            if not candles_1m:
+                candles_1m = []
+
+            current_price    = candles_5m[-1]["close"]
+            state.last_price = current_price
+
+            if state.positions:
+                last_closed = candles_5m[-2] if len(candles_5m) >= 2 else candles_5m[-1]
+                check_exits(current_price, last_closed)
+
+            signal = {"signal": None}
+            if len(state.positions) < MAX_POSITIONS:
+                cooldown_remaining = COOLDOWN_AFTER_SL - (time.time() - state.last_sl_time)
+                if cooldown_remaining > 0:
+                    signal = {"signal": None, "reason": f"Cooldown SL: {int(cooldown_remaining//60)}min"}
+                else:
+                    signal = calc_signal(candles_5m, candles_1m)
+                    if signal.get("signal"):
+                        open_position(signal, state.dd_level)
+
+            pos_desc = " | ".join(
+                f"{p['side'].upper()}[{p['setup']}]@${p['entry']:.1f}"
+                + (" [Ph3]" if p.get("phase") == 3 else " [Ph2]" if p.get("phase") == 2 else "")
+                for p in state.positions
+            ) if state.positions else "FLAT"
+
+            dd_pct = (state.peak_capital - state.capital) / state.peak_capital * 100 if state.peak_capital > 0 else 0
+            log.info(
+                f"${current_price:.2f} | {pos_desc} | "
+                f"Capital: ${state.paper_balance:.2f} | "
+                f"P&L: {state.paper_pnl:+.2f}$ | "
+                f"WR: {state.wr:.0f}% | DD: {dd_pct:.1f}% | "
+                f"{signal.get('reason', '-')}"
+            )
+
+        except KeyboardInterrupt:
+            log.info("Bot 2 arrêté")
+            break
+        except Exception as e:
+            log.error(f"Erreur: {e}")
+            time.sleep(60)
+            continue
+
+        time.sleep(LOOP_SECONDS)
+
+
+if __name__ == "__main__":
+    dashboard.init(state, trades)
+    t = threading.Thread(target=dashboard.run, daemon=True)
+    t.start()
+    log.info("Dashboard démarré")
+    main()
