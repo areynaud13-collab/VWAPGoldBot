@@ -248,9 +248,9 @@ def calc_signal(candles_5m, candles_1m):
     #  SETUP SHORT +3SD (priorité)
     # ══════════════════════════════════════════════════════
     if d_high >= sd3_h - tol and d_close < sd3_h + tol:
-        sl_price = round(sd3_h + at * 0.5, 2)
-        tp1      = round(vwap, 2)
-        tp2      = round(sd1_l, 2)
+        sl_price = round(sd3_h + at * 0.3, 2)
+        tp1      = round(sd2_h, 2)   # scalping : cible +2SD (~1SD de distance)
+        tp2      = round(sd1_h, 2)   # runner : cible +1SD
 
         dist_sl  = abs(sl_price - d_close)
         dist_tp1 = abs(d_close - tp1)
@@ -288,7 +288,7 @@ def calc_signal(candles_5m, candles_1m):
 
                 return {
                     "signal":   "short",
-                    "setup":    "+3SD→VWAP",
+                    "setup":    "+3SD→+2SD",
                     "score":    round(score, 1),
                     "price":    entry_price,
                     "atr":      round(at, 2),
@@ -310,9 +310,9 @@ def calc_signal(candles_5m, candles_1m):
     # ══════════════════════════════════════════════════════
     if (d_high >= sd2_h - tol and d_close < sd2_h + tol
             and d_high < sd3_h - tol * 0.5):
-        sl_price = round(sd2_h + at * 1.0, 2)  # SL : +2SD + 1×ATR — assez de marge pour le bruit
-        tp1      = round(vwap, 2)
-        tp2      = round(sd1_l, 2)
+        sl_price = round(sd2_h + at * 0.3, 2)
+        tp1      = round(sd1_h, 2)   # scalping : cible +1SD (~1SD de distance)
+        tp2      = round(vwap, 2)    # runner : cible VWAP
 
         dist_sl  = abs(sl_price - d_close)
         dist_tp1 = abs(d_close - tp1)
@@ -348,7 +348,7 @@ def calc_signal(candles_5m, candles_1m):
 
                 return {
                     "signal":   "short",
-                    "setup":    "+2SD→VWAP",
+                    "setup":    "+2SD→+1SD",
                     "score":    round(score, 1),
                     "price":    entry_price,
                     "atr":      round(at, 2),
@@ -369,9 +369,9 @@ def calc_signal(candles_5m, candles_1m):
     #  SETUP LONG -3SD (priorité)
     # ══════════════════════════════════════════════════════
     if d_low <= sd3_l + tol and d_close > sd3_l - tol:
-        sl_price = round(sd3_l - at * 0.5, 2)
-        tp1      = round(vwap, 2)
-        tp2      = round(sd1_h, 2)
+        sl_price = round(sd3_l - at * 0.3, 2)
+        tp1      = round(sd2_l, 2)   # scalping : cible -2SD (~1SD de distance)
+        tp2      = round(sd1_l, 2)   # runner : cible -1SD
 
         dist_sl  = abs(d_close - sl_price)
         dist_tp1 = abs(tp1 - d_close)
@@ -407,7 +407,7 @@ def calc_signal(candles_5m, candles_1m):
 
                 return {
                     "signal":   "long",
-                    "setup":    "-3SD→VWAP",
+                    "setup":    "-3SD→-2SD",
                     "score":    round(score, 1),
                     "price":    entry_price,
                     "atr":      round(at, 2),
@@ -429,9 +429,9 @@ def calc_signal(candles_5m, candles_1m):
     # ══════════════════════════════════════════════════════
     if (d_low <= sd2_l + tol and d_close > sd2_l - tol
             and d_low > sd3_l + tol * 0.5):
-        sl_price = round(sd3_l - at * 0.3, 2)
-        tp1      = round(vwap, 2)
-        tp2      = round(sd1_h, 2)
+        sl_price = round(sd2_l - at * 0.3, 2)
+        tp1      = round(sd1_l, 2)   # scalping : cible -1SD (~1SD de distance)
+        tp2      = round(vwap, 2)    # runner : cible VWAP
 
         dist_sl  = abs(d_close - sl_price)
         dist_tp1 = abs(tp1 - d_close)
@@ -467,7 +467,7 @@ def calc_signal(candles_5m, candles_1m):
 
                 return {
                     "signal":   "long",
-                    "setup":    "-2SD→VWAP",
+                    "setup":    "-2SD→-1SD",
                     "score":    round(score, 1),
                     "price":    entry_price,
                     "atr":      round(at, 2),
