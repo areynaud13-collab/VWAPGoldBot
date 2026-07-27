@@ -187,11 +187,6 @@ def calc_signal(candles_5m, candles_1m):
     if len(candles_1m) < 5:
         return {"signal": None, "reason": "Pas assez de bougies 1m"}
 
-    # ── Filtre session active (London 7h-12h UTC / NY 13h-17h UTC) ──
-    current_hour = datetime.now(timezone.utc).hour
-    if current_hour not in SESSION_HOURS_UTC:
-        return {"signal": None, "reason": f"Hors session active (heure UTC={current_hour}h) — London 7h-12h · NY 13h-17h"}
-
     # ── Données 5m ───────────────────────────────────────
     closes_5m  = [c["close"]  for c in candles_5m]
     highs_5m   = [c["high"]   for c in candles_5m]
@@ -214,8 +209,6 @@ def calc_signal(candles_5m, candles_1m):
     recent_atrs = [x for x in atr_arr[max(0, i - 30):i] if x is not None]
     avg_at      = np.mean(recent_atrs) if recent_atrs else at
 
-    if at / avg_at > 3.0:
-        return {"signal": None, "reason": "Volatilité excessive (news)"}
 
     if at < MIN_ATR:
         return {"signal": None, "reason": f"ATR trop faible ({at:.2f}$) — session morte, on ne trade pas"}
@@ -248,7 +241,7 @@ def calc_signal(candles_5m, candles_1m):
     #  SETUP SHORT +3SD (priorité)
     # ══════════════════════════════════════════════════════
     if d_high >= sd3_h - tol and d_close < sd3_h + tol:
-        sl_price = round(sd3_h + at * 0.3, 2)
+        sl_price = round(max(sd3_h + at * 0.3, d_close + 1.50), 2)
         tp1      = round(sd2_h, 2)   # scalping : cible +2SD (~1SD de distance)
         tp2      = round(sd1_h, 2)   # runner : cible +1SD
 
@@ -310,7 +303,7 @@ def calc_signal(candles_5m, candles_1m):
     # ══════════════════════════════════════════════════════
     if (d_high >= sd2_h - tol and d_close < sd2_h + tol
             and d_high < sd3_h - tol * 0.5):
-        sl_price = round(sd2_h + at * 0.3, 2)
+        sl_price = round(max(sd2_h + at * 0.3, d_close + 1.50), 2)
         tp1      = round(sd1_h, 2)   # scalping : cible +1SD (~1SD de distance)
         tp2      = round(vwap, 2)    # runner : cible VWAP
 
@@ -369,7 +362,7 @@ def calc_signal(candles_5m, candles_1m):
     #  SETUP LONG -3SD (priorité)
     # ══════════════════════════════════════════════════════
     if d_low <= sd3_l + tol and d_close > sd3_l - tol:
-        sl_price = round(sd3_l - at * 0.3, 2)
+        sl_price = round(min(sd3_l - at * 0.3, d_close - 1.50), 2)
         tp1      = round(sd2_l, 2)   # scalping : cible -2SD (~1SD de distance)
         tp2      = round(sd1_l, 2)   # runner : cible -1SD
 
@@ -429,7 +422,7 @@ def calc_signal(candles_5m, candles_1m):
     # ══════════════════════════════════════════════════════
     if (d_low <= sd2_l + tol and d_close > sd2_l - tol
             and d_low > sd3_l + tol * 0.5):
-        sl_price = round(sd2_l - at * 0.3, 2)
+        sl_price = round(min(sd2_l - at * 0.3, d_close - 1.50), 2)
         tp1      = round(sd1_l, 2)   # scalping : cible -1SD (~1SD de distance)
         tp2      = round(vwap, 2)    # runner : cible VWAP
 
