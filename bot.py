@@ -25,13 +25,31 @@ import dashboard
 
 
 # ── N8N Journal ────────────────────────────────────────
+def _sheet_safe(value):
+    """
+    Anti-formule Google Sheets — Ajout 2026-07-29.
+    En mode USER_ENTERED, une cellule commençant par '=', '+', '-' ou '@'
+    est interprétée comme une formule → #ERROR!. C'est exactement ce qui
+    corrompait le champ Setup des shorts ('+2SD→+1SD'). On préfixe d'une
+    apostrophe : Sheets stocke alors le texte tel quel.
+    """
+    if isinstance(value, str) and value[:1] in ("=", "+", "-", "@"):
+        return "'" + value
+    return value
+
+
 def notify_n8n(pos, event_type, pnl_lot1, pnl_lot2, total_pnl, phase_atteinte, resultat, exit_price=None):
     """Envoie les données du trade au webhook N8N Bot 2 → Google Sheets."""
     if not N8N_WEBHOOK_URL:
         return
     try:
-        now        = datetime.now(TZ_SWISS)
+        # FIX 2026-07-29 : la colonne s'appelle Heure_UTC mais recevait l'heure
+        # SUISSE (UTC+2 en été) → toutes les analyses par session étaient
+        # décalées de 2h. On journalise désormais en vrai UTC.
+        now        = datetime.now(timezone.utc)
         entry_time = pos.get("entry_time", now)
+        if entry_time.tzinfo is not None:
+            entry_time = entry_time.astimezone(timezone.utc)
         duree      = int((now - entry_time).total_seconds() / 60)
         tp2        = pos.get("tp_poc", pos["tp"])
         data = {
@@ -39,7 +57,7 @@ def notify_n8n(pos, event_type, pnl_lot1, pnl_lot2, total_pnl, phase_atteinte, r
             "Heure_UTC":           entry_time.strftime("%H:%M"),
             "Bot":                 "BOT2_VWAP",
             "Type":                event_type,
-            "Setup":               pos.get("setup", "VWAP"),
+            "Setup":               _sheet_safe(pos.get("setup", "VWAP")),
             "Score":               pos.get("score", 0),
             "Entree":              pos["entry"],
             "SL":                  pos["sl"],
@@ -56,6 +74,11 @@ def notify_n8n(pos, event_type, pnl_lot1, pnl_lot2, total_pnl, phase_atteinte, r
             "PnL_Total":           round(total_pnl, 2),
             "Capital_Avant":       round(pos.get("capital_at_entry", 0), 2),
             "Capital_Apres":       round(state.paper_balance, 2),
+            # Point 6 : risque effectif tracé → chaque trade lisible en R
+            "Risque_USD":          round(pos.get("risk_usd", 0), 2),
+            "Risque_Pct":          round(pos.get("risk_usd", 0)
+                                          / pos["capital_at_entry"] * 100, 2)
+                                    if pos.get("capital_at_entry") else 0,
             "Duree_min":           duree,
             "Prix_Sortie_Runner":  round(exit_price, 2) if event_type == "CLOSE_RUNNER" and exit_price is not None else "",
             "Runner_Bonus_vs_TP2": round(exit_price - tp2, 2) if event_type == "CLOSE_RUNNER" and exit_price is not None else "",
@@ -63,6 +86,55 @@ def notify_n8n(pos, event_type, pnl_lot1, pnl_lot2, total_pnl, phase_atteinte, r
         req.post(N8N_WEBHOOK_URL, json=data, timeout=5)
     except Exception as e:
         log.warning(f"N8N webhook erreur: {e}")
+
+
+# ── Journal des signaux bloqués (Point 2b — shadow log) ──
+# Objectif : mesurer ce que les filtres coûtent en fréquence au lieu de le
+# deviner. Chaque setup détecté mais refusé écrit une ligne SIGNAL_BLOQUE
+# dans le Google Sheet (throttle : 1 ligne max par motif / 15 min).
+BLOCK_PATTERNS = ("Expansion volatilité", "installé", "confirmation 1m absente",
+                  "Lockout", "DD N", "Anti-cluster", "KILL SWITCH", "RR insuffisant")
+
+
+def block_category(reason):
+    """Retourne la catégorie de blocage si le motif en est un, sinon None."""
+    for p in BLOCK_PATTERNS:
+        if p in reason:
+            return p
+    return None
+
+
+def notify_n8n_blocked(reason, price=0.0):
+    """Ligne SIGNAL_BLOQUE dans le journal — mêmes colonnes, valeurs neutres."""
+    if not N8N_WEBHOOK_URL:
+        return
+    try:
+        now = datetime.now(timezone.utc)
+        data = {
+            "Date":                now.strftime("%Y-%m-%d"),
+            "Heure_UTC":           now.strftime("%H:%M"),
+            "Bot":                 "BOT2_VWAP",
+            "Type":                "SIGNAL_BLOQUE",
+            "Setup":               _sheet_safe(str(reason)[:120]),
+            "Score":               0,
+            "Entree":              price,
+            "SL":                  0, "TP1": 0, "TP2": 0,
+            "VWAP":                "", "SD": "",
+            "ATR":                 0, "RR_Cible": 0,
+            "Phase_Atteinte":      0,
+            "Resultat":            "BLOQUE",
+            "PnL_Lot1":            0, "PnL_Lot2": 0, "PnL_Total": 0,
+            "Capital_Avant":       round(state.paper_balance, 2),
+            "Capital_Apres":       round(state.paper_balance, 2),
+            "Risque_USD":          0,
+            "Risque_Pct":          0,
+            "Duree_min":           0,
+            "Prix_Sortie_Runner":  "",
+            "Runner_Bonus_vs_TP2": "",
+        }
+        req.post(N8N_WEBHOOK_URL, json=data, timeout=5)
+    except Exception as e:
+        log.warning(f"N8N shadow log erreur: {e}")
 
 
 # ── Telegram ────────────────────────────────────────────
@@ -109,6 +181,13 @@ class State:
         self.peak_capital   = float(CAPITAL)
         self.dd_level       = 0
         self.dd_pause_until = 0
+        # Point 2 (2026-07-29) : lockout directionnel — N SL consécutifs
+        # dans une direction = cette direction se trompe de régime → on la
+        # coupe temporairement au lieu de re-perdre au même endroit.
+        self.consec_sl         = {"long": 0, "short": 0}
+        self.side_lockout_until = {"long": 0.0, "short": 0.0}
+        self.last_block_log     = {"motif": "", "ts": 0.0}   # throttle shadow log
+        self.last_entry_time    = {"long": 0.0, "short": 0.0}  # anti-cluster (Pt5)
 
     def reset_daily(self):
         if date.today() != self.start_date:
@@ -149,11 +228,67 @@ def calc_qty_risk(price, sl_price, risk_pct):
     return max(1, int(min(contracts_by_risk, contracts_by_margin)))
 
 
+def validate_signal(sig):
+    """
+    KILL SWITCH — Ajout 2026-07-29.
+    Aucun ordre ne part si le signal est incomplet ou incohérent.
+    Retourne (ok: bool, motif: str).
+    """
+    required = ("signal", "price", "sl_price", "tp_price", "atr", "setup", "score")
+    for k in required:
+        v = sig.get(k)
+        if v is None or (isinstance(v, str) and not v.strip()):
+            return False, f"champ manquant/vide: {k}"
+
+    setup = str(sig.get("setup", ""))
+    if "ERROR" in setup.upper() or setup.startswith(("=", "+")):
+        return False, f"label setup invalide: {setup!r}"
+
+    side  = sig["signal"]
+    price = sig["price"]
+    sl    = sig["sl_price"]
+    tp1   = sig["tp_price"]
+    tp2   = sig.get("tp_poc", tp1)
+
+    for name, v in (("price", price), ("sl", sl), ("tp1", tp1), ("tp2", tp2)):
+        if not isinstance(v, (int, float)) or v != v or v <= 0:  # v != v → NaN
+            return False, f"prix invalide: {name}={v!r}"
+
+    # Cohérence géométrique stricte selon la direction
+    if side == "long":
+        if not (sl < price < tp1):
+            return False, f"géométrie LONG incohérente: SL {sl} < entrée {price} < TP1 {tp1} non respecté"
+    elif side == "short":
+        if not (tp1 < price < sl):
+            return False, f"géométrie SHORT incohérente: TP1 {tp1} < entrée {price} < SL {sl} non respecté"
+    else:
+        return False, f"direction inconnue: {side!r}"
+
+    return True, ""
+
+
 def open_position(sig, dd_level=0):
     if len(state.positions) >= MAX_POSITIONS:
         return
 
+    # ── KILL SWITCH : signal invalide = zéro ordre, alerte immédiate ──
+    ok, motif = validate_signal(sig)
+    if not ok:
+        log.error(f"[KILL SWITCH] Signal rejeté — {motif} | sig={sig}")
+        tg(f"🛑 <b>BOT 2 — KILL SWITCH</b>\nSignal rejeté avant ordre :\n{motif}")
+        return f"KILL SWITCH: {motif}"
+
     side_str = sig["signal"]
+
+    # ── Anti sur-trading corrélé (Point 5) ──
+    if sum(1 for p in state.positions if p["side"] == side_str) >= MAX_POSITIONS_PER_SIDE:
+        return (f"Anti-cluster: déjà {MAX_POSITIONS_PER_SIDE} position {side_str.upper()} "
+                f"ouverte — pas de doublement du risque sur la même idée")
+    _since = time.time() - state.last_entry_time.get(side_str, 0.0)
+    if _since < ENTRY_COOLDOWN_SEC:
+        return (f"Anti-cluster: cooldown entrée {side_str.upper()} — "
+                f"encore {int(ENTRY_COOLDOWN_SEC - _since)}s")
+
     price    = sig["price"]
     atr      = sig["atr"]
     sl       = sig["sl_price"]
@@ -170,14 +305,16 @@ def open_position(sig, dd_level=0):
     sd2_l    = sig.get("sd2_l", 0)
     sd3_l    = sig.get("sd3_l", 0)
 
-    utc_hour = datetime.now(timezone.utc).hour
-
-    if utc_hour in REDUCED_RISK_HOURS:
-        effective_risk = REDUCED_RISK_PCT
-        log.info(f"Heure risque réduit {utc_hour:02d}h UTC")
-    elif dd_level >= 2:
+    # ── Point 6 (2026-07-29) : risque de base UNIQUE ──
+    # REDUCED_RISK_HOURS supprimé : réduire la mise sur un soupçon horaire
+    # brouillait la lecture en R du journal (pertes -2$ vs -15$). Le filtre
+    # d'expansion de volatilité (Pt2) fait ce travail en mieux : il coupe
+    # quand le marché est RÉELLEMENT agité — mesure, pas horloge.
+    # Seuls les paliers de drawdown modulent encore le risque (design assumé,
+    # désormais tracé dans le journal via Risque_Pct / Risque_USD).
+    if dd_level >= 2:
         effective_risk = RISK_PER_TRADE / 2
-        log.info("DD N2 — risque réduit à 1%")
+        log.info(f"DD N{dd_level} — risque réduit à {RISK_PER_TRADE / 2 * 100:.2f}%")
     else:
         effective_risk = RISK_PER_TRADE
 
@@ -253,6 +390,7 @@ def open_position(sig, dd_level=0):
         "sl":               sl,
         "tp":               tp,
         "tp_poc":           tp_poc,
+        "tp_runner":        sig.get("tp_runner", tp_poc),   # objectif runner (Pt7)
         "atr":              atr,
         "vwap":             vwap,
         "sd":               sd,
@@ -275,6 +413,7 @@ def open_position(sig, dd_level=0):
     })
     state.daily_trades += 1
     state.total_trades += 1
+    state.last_entry_time[side_str] = time.time()   # anti-cluster (Pt5)
 
 
 def check_exits(current_price, last_candle=None):
@@ -334,7 +473,10 @@ def check_exits(current_price, last_candle=None):
                 pos["runner_contracts"] = actual_runner
                 pos["phase"]            = 3
                 pos["runner_active"]    = True
-                pos["runner_sl"]        = tp2_price
+                # Point 7 (spec Anna) : plancher du runner = TP1, jamais en
+                # dessous. Le runner respire entre TP1 et son objectif ;
+                # retour sur TP1 → fermeture (profit TP1 toujours préservé).
+                pos["runner_sl"]        = pos["tp"]
                 pos["highest_close"]    = candle_close
                 pos["runner_stall"]     = 0
 
@@ -348,7 +490,8 @@ def check_exits(current_price, last_candle=None):
                     f"✅ TP2 (70% Lot2) : ${tp2_price:.2f}  P&L: +${pnl_tp2_close:.2f}$\n"
                     f"\n"
                     f"🏃 <b>Runner actif</b> : {actual_runner} contrats (30% Lot 2)\n"
-                    f"🛡️ SL plancher    : ${tp2_price:.2f}\n"
+                    f"🛡️ SL plancher    : ${pos['tp']:.2f} (TP1 — jamais en dessous)\n"
+                    f"🎯 Objectif runner : ${pos.get('tp_runner', tp2_price):.2f}\n"
                     f"📏 Chandelier     : {RUNNER_TRAIL_ATR}× ATR\n"
                     f"⏱️ Time exit      : {RUNNER_MAX_STALL} bougies 15m sans nouveau haut\n"
                     f"📈 Capital        : ${state.paper_balance:.2f}\n"
@@ -377,6 +520,7 @@ def check_exits(current_price, last_candle=None):
                 state.paper_pnl     += pnl_lot2
                 state.daily_pnl     += pnl_lot2
                 state.wins          += 1
+                state.consec_sl[pos["side"]] = 0
 
                 trades.append({"e": ep, "x": exit_price, "side": pos["side"],
                                "pnl": round(total_pnl, 2), "res": "TP1×2 (retour SL Lot 2)",
@@ -410,12 +554,57 @@ def check_exits(current_price, last_candle=None):
             stall        = pos.get("runner_stall", 0)
             atr          = pos["atr"]
 
+            tp_runner = pos.get("tp_runner", pos["tp_poc"])
             if pos["side"] == "long":
                 hit_runner_sl = candle_low  <= runner_sl
+                hit_tp3       = candle_high >= tp_runner
                 new_progress  = candle_close > hc
             else:
                 hit_runner_sl = candle_high >= runner_sl
+                hit_tp3       = candle_low  <= tp_runner
                 new_progress  = candle_close < hc
+
+            # ── Point 7 : objectif runner atteint → clôture au TP3 ──
+            if hit_tp3:
+                exit_price  = tp_runner
+                raw_pnl     = (exit_price - ep) / ep if pos["side"] == "long" else (ep - exit_price) / ep
+                pnl_runner  = raw_pnl * act_runner * state.contract_size * ep * LEVERAGE
+                total_pnl   = tp1_pnl + pnl_runner
+                acct_pct    = total_pnl / cap_entry * 100 if cap_entry else 0
+
+                if not PAPER_MODE:
+                    try:
+                        close_side = 2 if pos["side"] == "long" else 4
+                        exchange.place_order(close_side, act_runner)
+                    except Exception as e:
+                        log.error(f"Fermeture Runner TP3 error: {e}")
+                        still_open.append(pos)
+                        continue
+
+                state.paper_balance += pnl_runner
+                state.paper_pnl     += pnl_runner
+                state.daily_pnl     += pnl_runner
+                state.wins          += 1
+                state.consec_sl[pos["side"]] = 0
+
+                trades.append({"e": ep, "x": exit_price, "side": pos["side"],
+                               "pnl": round(total_pnl, 2), "res": "Runner (Objectif TP3)",
+                               "setup": setup, "date": datetime.now().strftime("%m/%d %H:%M")})
+                notify_n8n(pos, "CLOSE_RUNNER", tp1_pnl, pnl_runner, total_pnl, 3, "WIN", exit_price)
+
+                log.info(f"[Ph3→FIN] Runner OBJECTIF TP3 ${exit_price:.2f} · "
+                         f"P&L runner: {pnl_runner:+.2f}$ · P&L total: {total_pnl:+.2f}$")
+                tg(
+                    f"🏆 <b>BOT 2 — RUNNER : OBJECTIF ATTEINT — {setup}</b>\n"
+                    f"\n"
+                    f"📍 Entrée      : ${ep:.2f}\n"
+                    f"🎯 TP3 (bande) : ${exit_price:.2f}\n"
+                    f"💰 P&L runner  : <b>{pnl_runner:+.2f}$</b>\n"
+                    f"💰 P&L total   : <b>{total_pnl:+.2f}$</b>  ({acct_pct:+.2f}%)\n"
+                    f"📈 Capital     : ${state.paper_balance:.2f}\n"
+                    f"{'📄 PAPER MODE' if PAPER_MODE else '💰 LIVE BITGET'}"
+                )
+                continue
 
             # ── Trailing stop ──────────────────────────────
             if new_progress:
@@ -455,6 +644,7 @@ def check_exits(current_price, last_candle=None):
                 state.paper_pnl     += pnl_runner
                 state.daily_pnl     += pnl_runner
                 state.wins          += 1
+                state.consec_sl[pos["side"]] = 0
 
                 trades.append({"e": ep, "x": exit_price, "side": pos["side"],
                                "pnl": round(total_pnl, 2), "res": f"Runner ({exit_reason})",
@@ -565,6 +755,7 @@ def check_exits(current_price, last_candle=None):
                 state.paper_pnl     += pnl_usd
                 state.daily_pnl     += pnl_usd
                 state.wins          += 1
+                state.consec_sl[pos["side"]] = 0
 
                 trades.append({"e": ep, "x": exit_price, "side": pos["side"],
                                "pnl": round(pnl_usd, 2), "res": "TP1 (1 contrat)",
@@ -600,6 +791,20 @@ def check_exits(current_price, last_candle=None):
             state.daily_pnl     += pnl_usd
             state.losses        += 1
             state.last_sl_time   = time.time()
+
+            # ── Lockout directionnel (Point 2) ──────────
+            side_hit = pos["side"]
+            state.consec_sl[side_hit] += 1
+            if state.consec_sl[side_hit] >= CONSEC_SL_LOCKOUT_N:
+                state.side_lockout_until[side_hit] = time.time() + DIRECTION_LOCKOUT_SEC
+                state.consec_sl[side_hit] = 0
+                log.warning(f"[Lockout] {CONSEC_SL_LOCKOUT_N} SL consécutifs "
+                            f"{side_hit.upper()} — direction coupée "
+                            f"{DIRECTION_LOCKOUT_SEC//3600}h")
+                tg(f"🔒 <b>BOT 2 — LOCKOUT {side_hit.upper()}</b>\n"
+                   f"{CONSEC_SL_LOCKOUT_N} SL consécutifs dans cette direction.\n"
+                   f"Plus aucun {side_hit} pendant {DIRECTION_LOCKOUT_SEC//3600}h "
+                   f"— le régime lui donne tort.")
 
             trades.append({"e": ep, "x": exit_price, "side": pos["side"],
                            "pnl": round(pnl_usd, 2), "res": "SL",
@@ -720,16 +925,34 @@ def main():
                     signal = {"signal": None, "reason": f"Cooldown SL: {int(cooldown_remaining//60)}min"}
                 else:
                     signal = calc_signal(candles_5m, candles_1m)
+                    # ── Lockout directionnel (Point 2) ──
+                    sig_side = signal.get("signal")
+                    if sig_side and time.time() < state.side_lockout_until.get(sig_side, 0):
+                        mins = int((state.side_lockout_until[sig_side] - time.time()) // 60)
+                        signal = {"signal": None,
+                                  "reason": f"Lockout {sig_side.upper()} — encore {mins}min"}
                     if signal.get("signal"):
                         # DD Niveau 1 : score minimum relevé à MIN_SCORE+1 (idem Bot VP)
                         min_score_eff = MIN_SCORE + (1.0 if state.dd_level >= 1 else 0.0)
                         if signal.get("score", 0) >= min_score_eff:
-                            open_position(signal, state.dd_level)
+                            refus = open_position(signal, state.dd_level)
+                            if refus:
+                                signal = {"signal": None, "reason": refus}
                         else:
                             signal = {"signal": None,
                                       "reason": (f"DD N{state.dd_level} — score "
                                                  f"{signal.get('score', 0):.1f} "
                                                  f"< min {min_score_eff:.0f}")}
+
+            # ── Shadow log : setup détecté mais bloqué par un filtre ──
+            if not signal.get("signal"):
+                cat = block_category(signal.get("reason", ""))
+                if cat:
+                    _now = time.time()
+                    if (cat != state.last_block_log["motif"]
+                            or _now - state.last_block_log["ts"] > 900):
+                        notify_n8n_blocked(signal["reason"], current_price)
+                        state.last_block_log = {"motif": cat, "ts": _now}
 
             pos_desc = " | ".join(
                 f"{p['side'].upper()}[{p['setup']}]@${p['entry']:.1f}"
