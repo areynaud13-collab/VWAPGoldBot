@@ -215,8 +215,8 @@ def open_position(sig, dd_level=0):
         f"\n"
         f"📍 Entrée        : <b>${price:.2f}</b>\n"
         f"🛑 SL            : ${sl:.2f}\n"
-        f"🎯 TP1 (VWAP)   : ${tp:.2f}  ← objectif principal\n"
-        f"🏃 TP2 (runner) : ${tp_poc:.2f}  ← ±1SD opposé\n"
+        f"🎯 TP1 (±1SD)   : ${tp:.2f}  ← objectif scalping\n"
+        f"🏃 TP2 (runner s'active ici) : ${tp_poc:.2f}\n"
         f"\n"
         f"📐 <b>Contexte VWAP</b>\n"
         f"   VWAP  : {vwap:.2f}   SD : {sd:.2f}\n"
@@ -225,7 +225,7 @@ def open_position(sig, dd_level=0):
         f"\n"
         f"📊 RR 1:{rr}  · Score {score}/9\n"
         f"💼 Lot 1 : {lot1_contracts} contrats → ferme au TP1\n"
-        f"🏃 Lot 2 : {runner_contracts} contrats → runner vers TP2\n"
+        f"🏃 Lot 2 : {runner_contracts} contrats → runner s'active AU TP2\n"
         f"⚠️  Risque : {risk_pct:.1f}% = ${risk_real:.2f}\n"
         f"💰 Capital : ${cap_now:.2f}\n"
         f"{'📄 PAPER MODE' if PAPER_MODE else '💰 LIVE BITGET'}"
@@ -294,97 +294,9 @@ def check_exits(current_price, last_candle=None):
         phase     = pos.get("phase", 1)
 
         # ══════════════════════════════════════════════════
-        # PHASE 3 — RUNNER Chandelier Exit
-        # ══════════════════════════════════════════════════
-        if phase == 3:
-            runner_sl        = pos["runner_sl"]
-            runner_contracts = pos["runner_contracts"]
-
-            if pos["side"] == "long":
-                if candle_close > pos["highest_close"]:
-                    pos["highest_close"] = candle_close
-                    pos["runner_stall"]  = 0
-                else:
-                    pos["runner_stall"] += 1
-                new_trail        = pos["highest_close"] - RUNNER_TRAIL_ATR * atr
-                pos["runner_sl"] = max(runner_sl, new_trail)
-                runner_sl        = pos["runner_sl"]
-                hit_sl        = candle_low  <= runner_sl
-                hit_time_exit = pos["runner_stall"] >= RUNNER_MAX_STALL
-
-            else:  # short
-                if candle_close < pos["highest_close"] or pos["highest_close"] == 0.0:
-                    pos["highest_close"] = candle_close
-                    pos["runner_stall"]  = 0
-                else:
-                    pos["runner_stall"] += 1
-                new_trail        = pos["highest_close"] + RUNNER_TRAIL_ATR * atr
-                pos["runner_sl"] = min(runner_sl, new_trail)
-                runner_sl        = pos["runner_sl"]
-                hit_sl        = candle_high >= runner_sl
-                hit_time_exit = pos["runner_stall"] >= RUNNER_MAX_STALL
-
-            if not hit_sl and not hit_time_exit:
-                still_open.append(pos)
-                continue
-
-            exit_price = runner_sl if hit_sl else current_price
-            exit_label = ("SL Chandelier" if hit_sl
-                          else f"Time Exit ({RUNNER_MAX_STALL} bougies sans nouveau haut)")
-
-            raw_pnl    = (exit_price - ep) / ep if pos["side"] == "long" else (ep - exit_price) / ep
-            pnl_runner = raw_pnl * runner_contracts * state.contract_size * ep * LEVERAGE
-            tp1_pnl    = pos.get("tp1_pnl", 0.0)
-            total_pnl  = tp1_pnl + pnl_runner
-            acct_pct   = total_pnl / cap_entry * 100 if cap_entry else 0
-
-            if not PAPER_MODE:
-                try:
-                    close_side = 2 if pos["side"] == "long" else 4
-                    exchange.place_order(close_side, runner_contracts)
-                except Exception as e:
-                    log.error(f"Fermeture runner error: {e}")
-                    still_open.append(pos)
-                    continue
-
-            state.paper_balance += pnl_runner
-            state.paper_pnl     += pnl_runner
-            state.daily_pnl     += pnl_runner
-
-            if total_pnl > 0.01:      state.wins      += 1
-            elif abs(total_pnl) < 0.01: state.breakevens += 1
-            else:
-                state.losses       += 1
-                state.last_sl_time  = time.time()
-
-            trades.append({"e": ep, "x": exit_price, "side": pos["side"],
-                           "pnl": round(total_pnl, 2), "res": f"RUNNER — {exit_label}",
-                           "setup": setup, "date": datetime.now().strftime("%m/%d %H:%M")})
-            resultat_runner = "WIN" if total_pnl > 0.01 else ("LOSS" if total_pnl < -0.01 else "BE")
-            notify_n8n(pos, "CLOSE_RUNNER", tp1_pnl, pnl_runner, total_pnl, 3, resultat_runner, exit_price=exit_price)
-
-            log.info(f"[Ph3 RUNNER] {pos['side'].upper()} [{setup}] {exit_label} · "
-                     f"${ep:.2f}→${exit_price:.2f} · Runner: {pnl_runner:+.2f}$ · Total: {total_pnl:+.2f}$")
-            icon = "⏱️" if not hit_sl else ("📉" if pnl_runner < 0 else "💹")
-            tg(
-                f"{icon} <b>BOT 2 — RUNNER FERMÉ — {setup} — {exit_label}</b>\n"
-                f"\n"
-                f"📍 Entrée       : ${ep:.2f}\n"
-                f"✅ TP1 (VWAP)  : ${pos['tp']:.2f}   P&L: +${tp1_pnl:.2f}$\n"
-                f"🏁 Runner exit  : ${exit_price:.2f}  P&L: {pnl_runner:+.2f}$\n"
-                f"   (SL Chandelier: ${runner_sl:.2f})\n"
-                f"\n"
-                f"💰 P&L total    : <b>{total_pnl:+.2f}$</b>  ({acct_pct:+.2f}%)\n"
-                f"📈 Capital      : ${state.paper_balance:.2f}\n"
-                f"🎯 Win Rate     : {state.wr:.0f}%  ({state.wins}W / {state.losses}L)\n"
-                f"{'📄 PAPER MODE' if PAPER_MODE else '💰 LIVE BITGET'}"
-            )
-            continue
-
-        # ══════════════════════════════════════════════════
         # PHASE 2 — Lot 2 seul, SL = TP1, cible TP2
         # ══════════════════════════════════════════════════
-        elif phase == 2:
+        if phase == 2:
             sl_lot2          = pos["tp"]
             tp2_price        = pos["tp_poc"]
             runner_contracts = pos["runner_contracts"]
@@ -432,7 +344,7 @@ def check_exits(current_price, last_candle=None):
                     f"🚀 <b>BOT 2 — TP2 ATTEINT — {setup}</b>\n"
                     f"\n"
                     f"📍 Entrée         : ${ep:.2f}\n"
-                    f"✅ TP1 (VWAP)    : ${pos['tp']:.2f}   P&L: +${tp1_pnl:.2f}$\n"
+                    f"✅ TP1 (±1SD)    : ${pos['tp']:.2f}   P&L: +${tp1_pnl:.2f}$\n"
                     f"✅ TP2 (70% Lot2) : ${tp2_price:.2f}  P&L: +${pnl_tp2_close:.2f}$\n"
                     f"\n"
                     f"🏃 <b>Runner actif</b> : {actual_runner} contrats (30% Lot 2)\n"
@@ -478,6 +390,86 @@ def check_exits(current_price, last_candle=None):
                     f"✅ TP1 (Lot 1) : ${pos['tp']:.2f}   P&L: +${tp1_pnl:.2f}$\n"
                     f"🛑 SL Lot 2    : ${exit_price:.2f}  P&L: +${pnl_lot2:.2f}$\n"
                     f"💰 P&L total   : <b>+{total_pnl:.2f}$</b>  ({acct_pct:+.2f}%)\n"
+                    f"📈 Capital     : ${state.paper_balance:.2f}\n"
+                    f"🎯 Win Rate    : {state.wr:.0f}%  ({state.wins}W / {state.losses}L)\n"
+                    f"{'📄 PAPER MODE' if PAPER_MODE else '💰 LIVE BITGET'}"
+                )
+                continue
+
+            still_open.append(pos)
+            continue
+
+        # ══════════════════════════════════════════════════
+        # PHASE 3 — Runner seul · Trailing stop ATR · Stall timer
+        # ══════════════════════════════════════════════════
+        elif phase == 3:
+            runner_sl    = pos["runner_sl"]
+            act_runner   = pos["runner_contracts"]
+            tp1_pnl      = pos.get("tp1_pnl", 0.0)
+            hc           = pos.get("highest_close", candle_close)
+            stall        = pos.get("runner_stall", 0)
+            atr          = pos["atr"]
+
+            if pos["side"] == "long":
+                hit_runner_sl = candle_low  <= runner_sl
+                new_progress  = candle_close > hc
+            else:
+                hit_runner_sl = candle_high >= runner_sl
+                new_progress  = candle_close < hc
+
+            # ── Trailing stop ──────────────────────────────
+            if new_progress:
+                pos["highest_close"] = candle_close
+                pos["runner_stall"]  = 0
+                if pos["side"] == "long":
+                    new_trail = round(candle_close - atr * RUNNER_TRAIL_ATR, 2)
+                    pos["runner_sl"] = max(runner_sl, new_trail)
+                else:
+                    new_trail = round(candle_close + atr * RUNNER_TRAIL_ATR, 2)
+                    pos["runner_sl"] = min(runner_sl, new_trail)
+                runner_sl = pos["runner_sl"]
+                log.info(f"[Ph3] Nouveau haut ${candle_close:.2f} · Trailing SL → ${runner_sl:.2f}")
+            else:
+                pos["runner_stall"] = stall + 1
+
+            # ── Sortie : SL touché OU stall max ───────────
+            time_exit = pos["runner_stall"] >= RUNNER_MAX_STALL
+            if hit_runner_sl or time_exit:
+                exit_price  = runner_sl if hit_runner_sl else candle_close
+                raw_pnl     = (exit_price - ep) / ep if pos["side"] == "long" else (ep - exit_price) / ep
+                pnl_runner  = raw_pnl * act_runner * state.contract_size * ep * LEVERAGE
+                total_pnl   = tp1_pnl + pnl_runner
+                acct_pct    = total_pnl / cap_entry * 100 if cap_entry else 0
+                exit_reason = "SL Runner" if hit_runner_sl else f"Stall {RUNNER_MAX_STALL}×15m"
+
+                if not PAPER_MODE:
+                    try:
+                        close_side = 2 if pos["side"] == "long" else 4
+                        exchange.place_order(close_side, act_runner)
+                    except Exception as e:
+                        log.error(f"Fermeture Runner error: {e}")
+                        still_open.append(pos)
+                        continue
+
+                state.paper_balance += pnl_runner
+                state.paper_pnl     += pnl_runner
+                state.daily_pnl     += pnl_runner
+                state.wins          += 1
+
+                trades.append({"e": ep, "x": exit_price, "side": pos["side"],
+                               "pnl": round(total_pnl, 2), "res": f"Runner ({exit_reason})",
+                               "setup": setup, "date": datetime.now().strftime("%m/%d %H:%M")})
+                notify_n8n(pos, "CLOSE_RUNNER", tp1_pnl, pnl_runner, total_pnl, 3, "WIN", exit_price)
+
+                log.info(f"[Ph3→FIN] Runner fermé {exit_reason} · ${ep:.2f}→${exit_price:.2f} · "
+                         f"P&L runner: {pnl_runner:+.2f}$ · P&L total: {total_pnl:+.2f}$")
+                tg(
+                    f"🏃 <b>BOT 2 — RUNNER FERMÉ — {setup}</b>\n"
+                    f"\n"
+                    f"📍 Entrée      : ${ep:.2f}\n"
+                    f"🏁 Sortie      : ${exit_price:.2f}  ({exit_reason})\n"
+                    f"💰 P&L runner  : <b>{pnl_runner:+.2f}$</b>\n"
+                    f"💰 P&L total   : <b>{total_pnl:+.2f}$</b>  ({acct_pct:+.2f}%)\n"
                     f"📈 Capital     : ${state.paper_balance:.2f}\n"
                     f"🎯 Win Rate    : {state.wr:.0f}%  ({state.wins}W / {state.losses}L)\n"
                     f"{'📄 PAPER MODE' if PAPER_MODE else '💰 LIVE BITGET'}"
@@ -541,12 +533,12 @@ def check_exits(current_price, last_candle=None):
                     f"✅ <b>BOT 2 — TP1 ATTEINT — Lot 1 fermé — {setup}</b>\n"
                     f"\n"
                     f"📍 Entrée     : ${ep:.2f}\n"
-                    f"🎯 TP1 (VWAP) : ${tp:.2f}\n"
+                    f"🎯 TP1 (±1SD) : ${tp:.2f}\n"
                     f"💰 Lot 1 P&L  : <b>+${pnl_lot1:.2f}$</b>  ({acct_pct_lot1:+.2f}%)\n"
                     f"\n"
-                    f"📊 <b>Phase 2 — Lot 2 vers ±1SD</b> : {runner_contracts} contrats\n"
-                    f"🛑 SL Lot 2   : ${tp:.2f}  (= VWAP — profit garanti)\n"
-                    f"🎯 Cible TP2  : ${pos['tp_poc']:.2f}  (±1SD)\n"
+                    f"📊 <b>Phase 2 — Lot 2 continue</b> : {runner_contracts} contrats\n"
+                    f"🛑 SL Lot 2   : ${tp:.2f}  (= TP1 — profit garanti)\n"
+                    f"🏁 TP2 (runner s'active ici) : ${pos['tp_poc']:.2f}\n"
                     f"📈 Capital    : ${state.paper_balance:.2f}\n"
                     f"{'📄 PAPER MODE' if PAPER_MODE else '💰 LIVE BITGET'}"
                 )
@@ -660,7 +652,7 @@ def check_drawdown():
         elif state.dd_level == 2:
             tg(f"🟠 <b>BOT 2 — DD Niveau 2 — {dd_pct}%</b>\nRisque réduit à 1%")
         elif state.dd_level == 1:
-            tg(f"⚠️ <b>BOT 2 — DD Niveau 1 — {dd_pct}%</b>\nScore minimum relevé")
+            tg(f"⚠️ <b>BOT 2 — DD Niveau 1 — {dd_pct}%</b>\nSurveillance renforcée — stratégie inchangée")
 
     return True
 
@@ -717,8 +709,9 @@ def main():
             state.last_price = current_price
 
             if state.positions:
-                last_closed = candles_5m[-2] if len(candles_5m) >= 2 else candles_5m[-1]
-                check_exits(current_price, last_closed)
+                # Bougie EN COURS (candles_5m[-1]) : high/low/close live → détection
+                # immédiate SL/TP sans délai (idem Bot VP).
+                check_exits(current_price, candles_5m[-1])
 
             signal = {"signal": None}
             if len(state.positions) < MAX_POSITIONS:
@@ -728,7 +721,15 @@ def main():
                 else:
                     signal = calc_signal(candles_5m, candles_1m)
                     if signal.get("signal"):
-                        open_position(signal, state.dd_level)
+                        # DD Niveau 1 : score minimum relevé à MIN_SCORE+1 (idem Bot VP)
+                        min_score_eff = MIN_SCORE + (1.0 if state.dd_level >= 1 else 0.0)
+                        if signal.get("score", 0) >= min_score_eff:
+                            open_position(signal, state.dd_level)
+                        else:
+                            signal = {"signal": None,
+                                      "reason": (f"DD N{state.dd_level} — score "
+                                                 f"{signal.get('score', 0):.1f} "
+                                                 f"< min {min_score_eff:.0f}")}
 
             pos_desc = " | ".join(
                 f"{p['side'].upper()}[{p['setup']}]@${p['entry']:.1f}"
