@@ -43,14 +43,26 @@ def calc_cdv(closes, opens, volumes, period=20):
 
 def calc_vwap_session(candles_5m):
     """
-    VWAP journalier (reset 00:00 UTC) calculé sur les bougies 15m.
+    VWAP ancré à l'ouverture de la session active (reset institutionnel) :
+      · London  : 07:00 UTC
+      · New York: 13:00 UTC
+      · Nuit    : 00:00 UTC (fallback overnight)
+    Le SD repart de zéro à chaque session open → bandes serrées en début
+    de session, là où la liquidité institutionnelle est maximale.
     Retourne vwap, sd et les 6 bandes ±1SD/±2SD/±3SD.
     """
-    now           = datetime.now(timezone.utc)
-    session_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    session_ts    = session_start.timestamp()
+    now  = datetime.now(timezone.utc)
+    hour = now.hour
 
-    session = [c for c in candles_5m if c.get("timestamp", 0) / 1000 >= session_ts]
+    if hour >= 13:      # Session New York (13:00 UTC)
+        session_open = now.replace(hour=13, minute=0, second=0, microsecond=0)
+    elif hour >= 7:     # Session London  (07:00 UTC)
+        session_open = now.replace(hour=7,  minute=0, second=0, microsecond=0)
+    else:               # Nuit / pre-London (00:00 UTC)
+        session_open = now.replace(hour=0,  minute=0, second=0, microsecond=0)
+
+    session_ts = session_open.timestamp()
+    session    = [c for c in candles_5m if c.get("timestamp", 0) / 1000 >= session_ts]
     if len(session) < 5:
         session = candles_5m[-50:]
 
