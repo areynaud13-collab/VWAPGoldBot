@@ -62,7 +62,13 @@ def calc_vwap_session(candles_5m):
         session_open = now.replace(hour=0,  minute=0, second=0, microsecond=0)
 
     session_ts = session_open.timestamp()
-    session    = [c for c in candles_5m if c.get("timestamp", 0) / 1000 >= session_ts]
+    # FIX 2026-07-29 : bitget.get_candles() renvoie déjà le timestamp en SECONDES
+    # (int(k[0]) // 1000). L'ancienne division "/ 1000" ici le réduisait à ~1,78M,
+    # toujours inférieur à session_ts (~1,78 Md) → le filtre de session était
+    # TOUJOURS vide et le code retombait silencieusement sur les 50 dernières
+    # bougies. Conséquence : le bot n'a JAMAIS tradé un VWAP ancré à la session,
+    # mais un VWAP glissant de ~12h30 avec des bandes SD fausses.
+    session    = [c for c in candles_5m if c.get("timestamp", 0) >= session_ts]
     if len(session) < 5:
         session = candles_5m[-50:]
 
@@ -132,50 +138,67 @@ def confirm_entry_1m(candles_1m, side, sd_band_price, lookback=3):
             OU pin bar 1m avec mèche basse + close au-dessus de la bande
 
     Retourne (confirmed: bool, entry_price: float, confirmation_tag: str)
+
+    RENFORCÉ 2026-07-29 (Point 2) : la simple bougie directionnelle doit AUSSI
+    casser l'extrême de la bougie 1m précédente (micro-cassure de structure).
+    Sans cela, dans un rallye il y a toujours une bougie rouge parmi les 3
+    dernières minutes : ce n'était pas une confirmation, c'était un tampon
+    automatique (cf. les 13 shorts du 29/07). Le pin bar (mèche dominante) et
+    l'engulfing encodent déjà un vrai rejet.
     """
     if len(candles_1m) < 2:
         return False, None, ""
 
-    # On analyse les dernières bougies 1m
-    recent = candles_1m[-lookback:]
+    # Dernières bougies AVEC leur bougie précédente (pour la micro-cassure)
+    data = candles_1m[-(lookback + 1):]
 
     if side == "short":
-        for c in reversed(recent):
+        for k in range(len(data) - 1, 0, -1):
+            c, prev   = data[k], data[k - 1]
             body      = abs(c["close"] - c["open"])
             wick_up   = c["high"] - max(c["close"], c["open"])
             wick_down = min(c["close"], c["open"]) - c["low"]
 
-            bear_candle = c["close"] < c["open"] and c["close"] < sd_band_price
+            bear_candle = (c["close"] < c["open"] and c["close"] < sd_band_price
+                           and c["close"] < prev["low"])   # micro-cassure exigée
+            rng_c       = max(c["high"] - c["low"], 1e-9)
             pin_bar_sh  = (wick_up > body * 1.2
+                           and wick_up >= rng_c * 0.5      # mèche dominante (vrai rejet)
                            and c["close"] < sd_band_price
                            and c["close"] < c["open"])
             engulf_sh   = (c["close"] < c["open"]
                            and body > wick_down * 1.5
-                           and c["close"] < sd_band_price)
+                           and c["close"] < sd_band_price
+                           and c["close"] < prev["low"])   # micro-cassure exigée
 
             if bear_candle:
-                return True, c["close"], "1m_Bear"
+                return True, c["close"], "1m_Bear+Break"
             if pin_bar_sh:
                 return True, c["close"], "1m_PinBar"
             if engulf_sh:
                 return True, c["close"], "1m_Engulf"
 
     else:  # long
-        for c in reversed(recent):
+        for k in range(len(data) - 1, 0, -1):
+            c, prev   = data[k], data[k - 1]
             body      = abs(c["close"] - c["open"])
             wick_up   = c["high"] - max(c["close"], c["open"])
             wick_down = min(c["close"], c["open"]) - c["low"]
 
-            bull_candle = c["close"] > c["open"] and c["close"] > sd_band_price
+            bull_candle = (c["close"] > c["open"] and c["close"] > sd_band_price
+                           and c["close"] > prev["high"])  # micro-cassure exigée
+            rng_c       = max(c["high"] - c["low"], 1e-9)
             pin_bar_lg  = (wick_down > body * 1.2
+                           and wick_down >= rng_c * 0.5    # mèche dominante (vrai rejet)
                            and c["close"] > sd_band_price
                            and c["close"] > c["open"])
             engulf_lg   = (c["close"] > c["open"]
                            and body > wick_up * 1.5
-                           and c["close"] > sd_band_price)
+                           and c["close"] > sd_band_price
+                           and c["close"] > prev["high"])  # micro-cassure exigée
 
             if bull_candle:
-                return True, c["close"], "1m_Bull"
+                return True, c["close"], "1m_Bull+Break"
             if pin_bar_lg:
                 return True, c["close"], "1m_PinBar"
             if engulf_lg:
@@ -225,6 +248,16 @@ def calc_signal(candles_5m, candles_1m):
     if at < MIN_ATR:
         return {"signal": None, "reason": f"ATR trop faible ({at:.2f}$) — session morte, on ne trade pas"}
 
+    # ── FILTRE RÉGIME 1 (Point 2 — 2026-07-29) : expansion de volatilité ──
+    # Un marché dont l'ATR explose ne "revient" pas à la moyenne : il la
+    # déplace. L'ancien bonus ATRok (+0.5 pt) n'empêchait rien — le 29/07 le
+    # bot shortait dans un rallye parabolique. Désormais filtre DUR, deux sens.
+    if avg_at > 0 and at / avg_at > VOLATILITY_SPIKE_MAX:
+        return {"signal": None,
+                "reason": (f"Expansion volatilité: ATR {at:.2f}$ = "
+                           f"{at/avg_at:.1f}× moyenne (max {VOLATILITY_SPIKE_MAX}) "
+                           f"— régime tendanciel, mean-reversion suspendue")}
+
     # ── VWAP + SD (calculé sur 5m) ───────────────────────
     vp = calc_vwap_session(candles_5m)
     if vp is None:
@@ -253,6 +286,13 @@ def calc_signal(candles_5m, candles_1m):
     #  SETUP SHORT +3SD (priorité)
     # ══════════════════════════════════════════════════════
     if d_high >= sd3_h - tol and d_close < sd3_h + tol:
+        # ── FILTRE RÉGIME 2 (Point 2) : prix installé au-delà de ±2SD = tendance ──
+        recent_closes = closes_5m[max(0, i - (TREND_PERSIST_N - 1)): i + 1]
+        if sum(1 for c in recent_closes if c > sd2_h) >= TREND_PERSIST_K:
+            return {"signal": None,
+                    "reason": (f"{TREND_PERSIST_K}+/{TREND_PERSIST_N} closes 15m "
+                               "au-dessus de +2SD — trend haussier installé, short interdit")}
+
         sl_price = round(max(sd3_h + at * 0.3, d_close + 1.50), 2)
         tp1      = round(sd2_h, 2)   # scalping : cible +2SD (~1SD de distance)
         tp2      = round(sd1_h, 2)   # runner : cible +1SD
@@ -277,7 +317,7 @@ def calc_signal(candles_5m, candles_1m):
             if cdv_turning_bear:                     score += 1.5; tags.append("CDV↓")
             if at / avg_at < 1.8:                    score += 0.5; tags.append("ATRok")
 
-            if score >= MIN_SCORE:
+            if score >= MIN_SCORE_SHORT:
                 # ── Confirmation 1m ──────────────────────
                 confirmed, entry_1m, conf_tag = confirm_entry_1m(
                     candles_1m, "short", sd3_h, CONFIRM_LOOKBACK)
@@ -286,6 +326,24 @@ def calc_signal(candles_5m, candles_1m):
                     score += 1.5
                     tags.append(conf_tag)
                     entry_price = entry_1m
+                    # ── Point 4 : SL plancher ATR depuis l'entrée réelle ──
+                    # Le SL structurel (bande + 0.3×ATR) était calculé sur le
+                    # close 15m ; l'entrée réelle est le close 1m → distance
+                    # effective médiane 0.56×ATR = stop dans le bruit (20/24
+                    # pertes mortes en <60s). Plancher: SL_ATR_MIN×ATR depuis
+                    # l'entrée. La taille de position s'ajuste via calc_qty_risk
+                    # (même risque $). Puis double contrôle RR : si élargir le
+                    # stop casse la géométrie, le trade ne vaut plus la peine.
+                    sl_price  = round(max(sl_price, entry_price + SL_ATR_MIN * at), 2)
+                    _dist_sl  = abs(sl_price - entry_price)
+                    _rr1      = abs(entry_price - tp1) / _dist_sl if _dist_sl > 0 else 0
+                    _rr2      = abs(entry_price - tp2) / _dist_sl if _dist_sl > 0 else 0
+                    if _rr1 < MIN_RR_TP1 or _rr2 < MIN_RR_TP2:
+                        return {"signal": None,
+                                "reason": (f"RR insuffisant avec SL {SL_ATR_MIN}×ATR: "
+                                           f"TP1 {_rr1:.2f} (min {MIN_RR_TP1}) · "
+                                           f"TP2 {_rr2:.2f} (min {MIN_RR_TP2})")}
+
                 else:
                     # Pas de confirmation 1m → signal ignoré
                     return {"signal": None,
@@ -293,7 +351,8 @@ def calc_signal(candles_5m, candles_1m):
 
                 return {
                     "signal":   "short",
-                    "setup":    "+3SD→+2SD",
+                    "setup":    "SHORT +3SD→+2SD",
+                    "tp_runner": round(vwap, 2),
                     "score":    round(score, 1),
                     "price":    entry_price,
                     "atr":      round(at, 2),
@@ -315,6 +374,13 @@ def calc_signal(candles_5m, candles_1m):
     # ══════════════════════════════════════════════════════
     if (d_high >= sd2_h - tol and d_close < sd2_h + tol
             and d_high < sd3_h - tol * 0.5):
+        # ── FILTRE RÉGIME 2 (Point 2) : prix installé au-delà de ±2SD = tendance ──
+        recent_closes = closes_5m[max(0, i - (TREND_PERSIST_N - 1)): i + 1]
+        if sum(1 for c in recent_closes if c > sd2_h) >= TREND_PERSIST_K:
+            return {"signal": None,
+                    "reason": (f"{TREND_PERSIST_K}+/{TREND_PERSIST_N} closes 15m "
+                               "au-dessus de +2SD — trend haussier installé, short interdit")}
+
         sl_price = round(max(sd2_h + at * 0.3, d_close + 1.50), 2)
         tp1      = round(sd1_h, 2)   # scalping : cible +1SD (~1SD de distance)
         tp2      = round(vwap, 2)    # runner : cible VWAP
@@ -339,7 +405,7 @@ def calc_signal(candles_5m, candles_1m):
             if cdv_turning_bear:                     score += 1.5; tags.append("CDV↓")
             if at / avg_at < 1.5:                    score += 0.5; tags.append("ATRok")
 
-            if score >= MIN_SCORE:
+            if score >= MIN_SCORE_SHORT:
                 confirmed, entry_1m, conf_tag = confirm_entry_1m(
                     candles_1m, "short", sd2_h, CONFIRM_LOOKBACK)
 
@@ -347,13 +413,32 @@ def calc_signal(candles_5m, candles_1m):
                     score += 1.5
                     tags.append(conf_tag)
                     entry_price = entry_1m
+                    # ── Point 4 : SL plancher ATR depuis l'entrée réelle ──
+                    # Le SL structurel (bande + 0.3×ATR) était calculé sur le
+                    # close 15m ; l'entrée réelle est le close 1m → distance
+                    # effective médiane 0.56×ATR = stop dans le bruit (20/24
+                    # pertes mortes en <60s). Plancher: SL_ATR_MIN×ATR depuis
+                    # l'entrée. La taille de position s'ajuste via calc_qty_risk
+                    # (même risque $). Puis double contrôle RR : si élargir le
+                    # stop casse la géométrie, le trade ne vaut plus la peine.
+                    sl_price  = round(max(sl_price, entry_price + SL_ATR_MIN * at), 2)
+                    _dist_sl  = abs(sl_price - entry_price)
+                    _rr1      = abs(entry_price - tp1) / _dist_sl if _dist_sl > 0 else 0
+                    _rr2      = abs(entry_price - tp2) / _dist_sl if _dist_sl > 0 else 0
+                    if _rr1 < MIN_RR_TP1 or _rr2 < MIN_RR_TP2:
+                        return {"signal": None,
+                                "reason": (f"RR insuffisant avec SL {SL_ATR_MIN}×ATR: "
+                                           f"TP1 {_rr1:.2f} (min {MIN_RR_TP1}) · "
+                                           f"TP2 {_rr2:.2f} (min {MIN_RR_TP2})")}
+
                 else:
                     return {"signal": None,
                             "reason": f"+2SD SHORT détecté (score {score:.1f}) mais confirmation 1m absente"}
 
                 return {
                     "signal":   "short",
-                    "setup":    "+2SD→+1SD",
+                    "setup":    "SHORT +2SD→+1SD",
+                    "tp_runner": round(sd1_l, 2),
                     "score":    round(score, 1),
                     "price":    entry_price,
                     "atr":      round(at, 2),
@@ -374,6 +459,13 @@ def calc_signal(candles_5m, candles_1m):
     #  SETUP LONG -3SD (priorité)
     # ══════════════════════════════════════════════════════
     if d_low <= sd3_l + tol and d_close > sd3_l - tol:
+        # ── FILTRE RÉGIME 2 (Point 2) : prix installé au-delà de ±2SD = tendance ──
+        recent_closes = closes_5m[max(0, i - (TREND_PERSIST_N - 1)): i + 1]
+        if sum(1 for c in recent_closes if c < sd2_l) >= TREND_PERSIST_K:
+            return {"signal": None,
+                    "reason": (f"{TREND_PERSIST_K}+/{TREND_PERSIST_N} closes 15m "
+                               "sous -2SD — trend baissier installé, long interdit")}
+
         sl_price = round(min(sd3_l - at * 0.3, d_close - 1.50), 2)
         tp1      = round(sd2_l, 2)   # scalping : cible -2SD (~1SD de distance)
         tp2      = round(sd1_l, 2)   # runner : cible -1SD
@@ -406,13 +498,26 @@ def calc_signal(candles_5m, candles_1m):
                     score += 1.5
                     tags.append(conf_tag)
                     entry_price = entry_1m
+                    # ── Point 4 : SL plancher ATR depuis l'entrée réelle ──
+                    # (voir bloc short — logique miroir)
+                    sl_price  = round(min(sl_price, entry_price - SL_ATR_MIN * at), 2)
+                    _dist_sl  = abs(entry_price - sl_price)
+                    _rr1      = abs(tp1 - entry_price) / _dist_sl if _dist_sl > 0 else 0
+                    _rr2      = abs(tp2 - entry_price) / _dist_sl if _dist_sl > 0 else 0
+                    if _rr1 < MIN_RR_TP1 or _rr2 < MIN_RR_TP2:
+                        return {"signal": None,
+                                "reason": (f"RR insuffisant avec SL {SL_ATR_MIN}×ATR: "
+                                           f"TP1 {_rr1:.2f} (min {MIN_RR_TP1}) · "
+                                           f"TP2 {_rr2:.2f} (min {MIN_RR_TP2})")}
+
                 else:
                     return {"signal": None,
                             "reason": f"-3SD LONG détecté (score {score:.1f}) mais confirmation 1m absente"}
 
                 return {
                     "signal":   "long",
-                    "setup":    "-3SD→-2SD",
+                    "setup":    "LONG -3SD→-2SD",
+                    "tp_runner": round(vwap, 2),
                     "score":    round(score, 1),
                     "price":    entry_price,
                     "atr":      round(at, 2),
@@ -434,6 +539,13 @@ def calc_signal(candles_5m, candles_1m):
     # ══════════════════════════════════════════════════════
     if (d_low <= sd2_l + tol and d_close > sd2_l - tol
             and d_low > sd3_l + tol * 0.5):
+        # ── FILTRE RÉGIME 2 (Point 2) : prix installé au-delà de ±2SD = tendance ──
+        recent_closes = closes_5m[max(0, i - (TREND_PERSIST_N - 1)): i + 1]
+        if sum(1 for c in recent_closes if c < sd2_l) >= TREND_PERSIST_K:
+            return {"signal": None,
+                    "reason": (f"{TREND_PERSIST_K}+/{TREND_PERSIST_N} closes 15m "
+                               "sous -2SD — trend baissier installé, long interdit")}
+
         sl_price = round(min(sd2_l - at * 0.3, d_close - 1.50), 2)
         tp1      = round(sd1_l, 2)   # scalping : cible -1SD (~1SD de distance)
         tp2      = round(vwap, 2)    # runner : cible VWAP
@@ -466,13 +578,26 @@ def calc_signal(candles_5m, candles_1m):
                     score += 1.5
                     tags.append(conf_tag)
                     entry_price = entry_1m
+                    # ── Point 4 : SL plancher ATR depuis l'entrée réelle ──
+                    # (voir bloc short — logique miroir)
+                    sl_price  = round(min(sl_price, entry_price - SL_ATR_MIN * at), 2)
+                    _dist_sl  = abs(entry_price - sl_price)
+                    _rr1      = abs(tp1 - entry_price) / _dist_sl if _dist_sl > 0 else 0
+                    _rr2      = abs(tp2 - entry_price) / _dist_sl if _dist_sl > 0 else 0
+                    if _rr1 < MIN_RR_TP1 or _rr2 < MIN_RR_TP2:
+                        return {"signal": None,
+                                "reason": (f"RR insuffisant avec SL {SL_ATR_MIN}×ATR: "
+                                           f"TP1 {_rr1:.2f} (min {MIN_RR_TP1}) · "
+                                           f"TP2 {_rr2:.2f} (min {MIN_RR_TP2})")}
+
                 else:
                     return {"signal": None,
                             "reason": f"-2SD LONG détecté (score {score:.1f}) mais confirmation 1m absente"}
 
                 return {
                     "signal":   "long",
-                    "setup":    "-2SD→-1SD",
+                    "setup":    "LONG -2SD→-1SD",
+                    "tp_runner": round(sd1_h, 2),
                     "score":    round(score, 1),
                     "price":    entry_price,
                     "atr":      round(at, 2),
