@@ -53,7 +53,7 @@ CDV_PERIOD = 20         # Sur les bougies 5m
 # ── Score minimum ───────────────────────────────────────
 # Score 5m max : 9 pts (zone SD + pin bar + sweep + CDV + ATR)
 # Bonus confirmation 1m : +1.5 pts si bougie 1m confirme
-MIN_SCORE = 5.0         # Relevé 4→5 : exige 3 confirmations convergentes minimum
+MIN_SCORE = 4.0         # 4.0 : 2 confirmations convergentes suffisent — données en priorité
 
 # ── RR minimum ──────────────────────────────────────────
 MIN_RR = 1.2
@@ -70,8 +70,8 @@ SESSION_HOURS_UTC = list(range(7, 12)) + list(range(13, 18))  # [7,8,9,10,11,13,
 # ── Runner — même logique 3 phases que Bot 1 ────────────
 RUNNER_PCT       = 0.50
 RUNNER_TP2_KEEP  = 0.30
-RUNNER_TRAIL_ATR = 1.5
-RUNNER_MAX_STALL = 4    # 4 bougies 15m = 60 minutes
+RUNNER_TRAIL_ATR = 1.5   # Trail = 1.5×ATR depuis highest close (plus large que VP car moves VWAP = 2×SD)
+RUNNER_MAX_STALL = 20    # 20 boucles 1m = 20 min sans nouveau high close → exit runner
 
 # ── Sécurité ────────────────────────────────────────────
 COOLDOWN_AFTER_SL = 5 * 60
