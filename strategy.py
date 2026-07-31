@@ -1,7 +1,7 @@
 # ═══════════════════════════════════════════════════════
 # STRATEGY — VWAP ±1SD Scalper · XAU/USDT · MTF 5m/1m
 # ─────────────────────────────────────────────────────
-# Version haute fréquence : 15-25 signaux/jour
+# Version haute fréquence — Audit 2 (2026-07-31)
 #
 # Logique institutionnelle mean-reversion :
 #   Signal sur ±1SD du VWAP session (touche 15-25x/jour)
@@ -12,7 +12,10 @@
 #   SHORT : rejet +1SD → TP VWAP
 #   LONG  : rejet -1SD → TP VWAP
 #
-# Filtres :
+# Filtres Audit 2 :
+#   · Session uniquement 07h-17h UTC (London + NY)
+#   · Détecteur de régime tendanciel (suspend mean-reversion)
+#   · SL minimum absolu 5$ (évite stops dans le bruit)
 #   · ATR minimum (session active)
 #   · Expansion volatilité (news/parabole)
 #   · CDV : confirmation delta volume
@@ -22,6 +25,49 @@
 import numpy as np
 from datetime import datetime, timezone
 from config import *
+
+
+def is_trading_session() -> bool:
+    """
+    Filtre session institutionnel — Audit 2.
+    On ne trade qu'en London (07h-12h UTC) et New York (13h-17h UTC).
+    La session asiatique (17h-07h UTC) est exclue : liquidité faible,
+    moves erratiques, mean-reversion peu fiable sur XAU.
+    """
+    hour = datetime.now(timezone.utc).hour
+    return (7 <= hour < 12) or (13 <= hour < 17)
+
+
+def detect_trend_regime(closes, highs, lows, atr, n=3, multiplier=1.5) -> str:
+    """
+    Détecteur de régime tendanciel — Audit 2.
+    Concept institutionnel : un algo mean-reversion doit savoir
+    quand le marché n'est PAS en mean-reversion.
+
+    Analyse les N dernières bougies 5m :
+    - Si N bougies consécutives baissières ET move total > multiplier×ATR
+      → régime BEAR (tendance baissière) → suspendre les LONG
+    - Si N bougies consécutives haussières ET move total > multiplier×ATR
+      → régime BULL (tendance haussière) → suspendre les SHORT
+    - Sinon → régime RANGE → mean-reversion autorisé
+
+    Retourne : "BEAR", "BULL", ou "RANGE"
+    """
+    if len(closes) < n + 1 or atr is None or atr <= 0:
+        return "RANGE"
+
+    recent = closes[-(n + 1):]
+    move_total = abs(recent[-1] - recent[0])
+
+    # Toutes les bougies dans le même sens ?
+    all_bear = all(recent[i] < recent[i-1] for i in range(1, len(recent)))
+    all_bull = all(recent[i] > recent[i-1] for i in range(1, len(recent)))
+
+    if all_bear and move_total > multiplier * atr:
+        return "BEAR"
+    if all_bull and move_total > multiplier * atr:
+        return "BULL"
+    return "RANGE"
 
 
 def calc_atr(highs, lows, closes, period=14):
@@ -222,6 +268,16 @@ def calc_signal(candles_5m, candles_1m):
     if at < MIN_ATR:
         return {"signal": None, "reason": f"ATR trop faible ({at:.2f}$) — session morte"}
 
+    # ── Filtre session (Audit 2) ──────────────────────────
+    # London 07h-12h UTC + New York 13h-17h UTC uniquement
+    if not is_trading_session():
+        return {"signal": None, "reason": "Hors session London/NY (07h-12h / 13h-17h UTC) — suspendu"}
+
+    # ── Détecteur de régime (Audit 2) ────────────────────
+    regime = detect_trend_regime(closes_5m, highs_5m, lows_5m, at,
+                                 n=REGIME_CANDLES_N,
+                                 multiplier=REGIME_ATR_MULT)
+
     # ── Filtre expansion volatilité ───────────────────────
     # Marché en mouvement parabolique → mean-reversion ne fonctionne pas
     if avg_at > 0 and at / avg_at > VOLATILITY_SPIKE_MAX:
@@ -256,21 +312,30 @@ def calc_signal(candles_5m, candles_1m):
     # ══════════════════════════════════════════════════════
     if d_high >= sd1_h - tol and d_close < sd1_h + tol:
 
-        # Filtre tendance : si le prix reste installé au-dessus de +1SD
-        # depuis plusieurs bougies, ce n'est pas du mean-reversion, c'est
-        # une tendance → on ne shorte pas
+        # Filtre régime (Audit 2) : tendance haussière → short interdit
+        if regime == "BULL":
+            return {"signal": None,
+                    "reason": f"Régime BULL détecté ({REGIME_CANDLES_N} bougies haussières >{REGIME_ATR_MULT}×ATR) — short suspendu"}
+
+        # Filtre tendance installée sur ±1SD
         recent_closes = closes_5m[max(0, i - (TREND_PERSIST_N - 1)): i + 1]
         if sum(1 for c in recent_closes if c > sd1_h) >= TREND_PERSIST_K:
             return {"signal": None,
                     "reason": f"{TREND_PERSIST_K}+/{TREND_PERSIST_N} closes au-dessus de +1SD — tendance haussière, short interdit"}
 
-        # SL au-delà de +1SD + buffer ATR
-        sl_price = round(max(sd1_h + at * SL_ATR_BUFFER, d_close + 1.00), 2)
+        # SL au-delà de +1SD + buffer ATR + plancher absolu (Audit 2)
+        sl_price = round(max(sd1_h + at * SL_ATR_BUFFER, d_close + SL_MIN_ABS), 2)
         tp1      = round(vwap, 2)   # Target : VWAP central
 
         dist_sl  = abs(sl_price - d_close)
         dist_tp1 = abs(d_close - tp1)
         est_rr   = dist_tp1 / dist_sl if dist_sl > 0 else 0
+
+        # Cohérence SL/TP (Audit 2) : si le VWAP est trop proche,
+        # le TP ne couvre pas le SL minimum → trade non viable
+        if dist_tp1 < SL_MIN_ABS * MIN_RR_TP1:
+            return {"signal": None,
+                    "reason": f"TP trop proche du VWAP ({dist_tp1:.1f}$) — distance minimum {SL_MIN_ABS * MIN_RR_TP1:.1f}$ requise"}
 
         if tp1 < d_close and est_rr >= MIN_RR:
 
@@ -349,19 +414,30 @@ def calc_signal(candles_5m, candles_1m):
     # ══════════════════════════════════════════════════════
     if d_low <= sd1_l + tol and d_close > sd1_l - tol:
 
-        # Filtre tendance baissière installée
+        # Filtre régime (Audit 2) : tendance baissière → long interdit
+        if regime == "BEAR":
+            return {"signal": None,
+                    "reason": f"Régime BEAR détecté ({REGIME_CANDLES_N} bougies baissières >{REGIME_ATR_MULT}×ATR) — long suspendu"}
+
+        # Filtre tendance installée sur ±1SD
         recent_closes = closes_5m[max(0, i - (TREND_PERSIST_N - 1)): i + 1]
         if sum(1 for c in recent_closes if c < sd1_l) >= TREND_PERSIST_K:
             return {"signal": None,
                     "reason": f"{TREND_PERSIST_K}+/{TREND_PERSIST_N} closes sous -1SD — tendance baissière, long interdit"}
 
-        # SL en dessous de -1SD + buffer ATR
-        sl_price = round(min(sd1_l - at * SL_ATR_BUFFER, d_close - 1.00), 2)
+        # SL en dessous de -1SD + buffer ATR + plancher absolu (Audit 2)
+        sl_price = round(min(sd1_l - at * SL_ATR_BUFFER, d_close - SL_MIN_ABS), 2)
         tp1      = round(vwap, 2)   # Target : VWAP central
 
         dist_sl  = abs(d_close - sl_price)
         dist_tp1 = abs(tp1 - d_close)
         est_rr   = dist_tp1 / dist_sl if dist_sl > 0 else 0
+
+        # Cohérence SL/TP (Audit 2) : si le VWAP est trop proche,
+        # le TP ne couvre pas le SL minimum → trade non viable
+        if dist_tp1 < SL_MIN_ABS * MIN_RR_TP1:
+            return {"signal": None,
+                    "reason": f"TP trop proche du VWAP ({dist_tp1:.1f}$) — distance minimum {SL_MIN_ABS * MIN_RR_TP1:.1f}$ requise"}
 
         if tp1 > d_close and est_rr >= MIN_RR:
 
