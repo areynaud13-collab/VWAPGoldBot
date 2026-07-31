@@ -88,10 +88,25 @@ LOOP_SECONDS = 60         # Vérification toutes les 60 secondes
 
 # ── Filtres de régime ─────────────────────────────────────
 VOLATILITY_SPIKE_MAX = 1.8    # ATR courant / ATR moyen max avant suspension
-                               # (légèrement plus tolérant que v1 — moves ±1SD
-                               # sont plus fréquents donc seuil adapté)
 TREND_PERSIST_N      = 3      # Fenêtre test tendance installée (bougies 5m)
 TREND_PERSIST_K      = 2      # K closes au-delà de ±1SD sur N → tendance, skip
+
+# ── Détecteur de régime tendanciel (Audit 2) ─────────────
+# Si N bougies 5m consécutives dans le même sens ET move > mult×ATR
+# → régime tendanciel → mean-reversion suspendue dans ce sens
+# Evite les 8 pertes consécutives LONG dans une journée baissière
+REGIME_CANDLES_N  = 3         # Nombre de bougies consécutives à analyser
+REGIME_ATR_MULT   = 1.5       # Move total minimum en ATR pour confirmer la tendance
+
+# ── Filtre session (Audit 2) ──────────────────────────────
+# London 07h-12h UTC + New York 13h-17h UTC uniquement
+# Session asiatique exclue : liquidité faible, stops dans le bruit
+# Paramétré dans strategy.py / is_trading_session()
+
+# ── SL minimum absolu (Audit 2) ──────────────────────────
+# Sur XAU, le bruit normal = 2-4$ par minute.
+# Un SL < 5$ se fait toucher par le bruit avant le vrai move.
+SL_MIN_ABS = 5.0              # Distance SL minimale en $ absolu depuis l'entrée
 
 # ── Anti-clustering ──────────────────────────────────────
 MAX_POSITIONS_PER_SIDE = 1    # Jamais 2 positions dans le même sens simultanément
